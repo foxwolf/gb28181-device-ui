@@ -1,0 +1,24 @@
+# 构建产物
+gb28181-device-ui.exe
+gb28181-device-ui
+*.exe
+*.test
+*.out
+*.dll
+
+# 本地配置（可能含 SIP 密码，切勿提交）
+gb28181-device-ui.json
+gb28181-device-ui.json.bak
+
+# Go
+vendor/
+go.work
+go.work.sum
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
