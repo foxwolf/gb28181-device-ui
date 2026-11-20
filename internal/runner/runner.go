@@ -1,4 +1,4 @@
-// Package runner 封装 gb28181-go 设备侧（UAC）的启动、停止和合成视频循环。
+// Package runner 封装 gb28181-go 设备侧（UAC）的启动、停止和可插拔视频采集。
 package runner
 
 import (
@@ -14,6 +14,7 @@ import (
 
 	"gb28181-device-ui/internal/appconfig"
 	"gb28181-device-ui/internal/logview"
+	"gb28181-device-ui/internal/videosrc"
 )
 
 var (
@@ -51,6 +52,7 @@ type Runner struct {
 	err    string
 	cancel context.CancelFunc
 	srv    *device.Server
+	video  videosrc.Session
 	done   chan struct{}
 	logs   *logview.Buffer
 }
@@ -92,6 +94,11 @@ func (r *Runner) Start(cfg appconfig.Config) error {
 		return formatValidate(err)
 	}
 
+	backend, dev, err := resolveVideo(cfg)
+	if err != nil {
+		return err
+	}
+
 	r.mu.Lock()
 	if r.state == StateRunning {
 		r.mu.Unlock()
@@ -110,6 +117,12 @@ func (r *Runner) Start(cfg appconfig.Config) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	hub := device.NewFrameHub()
+	sess, err := backend.Open(ctx, dev, videosrc.Options{FPS: 25}, hub)
+	if err != nil {
+		cancel()
+		return err
+	}
+
 	srv := device.New(devCfg, info, hub)
 	done := make(chan struct{})
 
@@ -118,6 +131,7 @@ func (r *Runner) Start(cfg appconfig.Config) error {
 	r.err = ""
 	r.cancel = cancel
 	r.srv = srv
+	r.video = sess
 	r.done = done
 	r.mu.Unlock()
 
@@ -132,14 +146,19 @@ func (r *Runner) Start(cfg appconfig.Config) error {
 		"local_sip_port", devCfg.LocalSIPPort,
 		"transport", devCfg.Transport,
 	)
-	slog.Info("界面：视频为库内合成的占位 H.264 帧（每秒一帧，每 5 帧一个 IDR），不是 RTSP 实况")
+	logVideoStart(backend, dev)
 
-	go r.loop(ctx, cancel, srv, hub, done)
+	go r.loop(ctx, cancel, srv, sess, done)
 	return nil
 }
 
-func (r *Runner) loop(ctx context.Context, cancel context.CancelFunc, srv *device.Server, hub *device.FrameHub, done chan struct{}) {
+func (r *Runner) loop(ctx context.Context, cancel context.CancelFunc, srv *device.Server, video videosrc.Session, done chan struct{}) {
 	defer close(done)
+	defer func() {
+		if video != nil {
+			_ = video.Close()
+		}
+	}()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -149,9 +168,12 @@ func (r *Runner) loop(ctx context.Context, cancel context.CancelFunc, srv *devic
 	// 绑定成功后尽快把实际端口和平台信息刷到状态栏。
 	go r.pollServer(ctx, srv)
 
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for i := 0; ; i++ {
+	videoDone := make(chan error, 1)
+	if video != nil {
+		go func() { videoDone <- video.Wait() }()
+	}
+
+	for {
 		select {
 		case <-ctx.Done():
 			srv.Stop()
@@ -168,8 +190,23 @@ func (r *Runner) loop(ctx context.Context, cancel context.CancelFunc, srv *devic
 			srv.Stop()
 			r.finish(nil)
 			return
-		case <-ticker.C:
-			hub.Write(syntheticAU(i))
+		case err := <-videoDone:
+			if ctx.Err() != nil {
+				srv.Stop()
+				r.finish(nil)
+				return
+			}
+			if err != nil {
+				slog.Error("界面：视频采集中断", "error", err)
+				cancel()
+				srv.Stop()
+				r.finish(fmt.Errorf("视频采集中断：%w", err))
+				return
+			}
+			cancel()
+			srv.Stop()
+			r.finish(nil)
+			return
 		}
 	}
 }
@@ -198,6 +235,7 @@ func (r *Runner) finish(err error) {
 	defer r.mu.Unlock()
 	r.cancel = nil
 	r.srv = nil
+	r.video = nil
 	if err != nil {
 		r.state = StateError
 		r.err = formatStartErr(err)
@@ -217,6 +255,7 @@ func (r *Runner) Stop() {
 	}
 	srv := r.srv
 	cancel := r.cancel
+	video := r.video
 	done := r.done
 	r.mu.Unlock()
 
@@ -230,6 +269,9 @@ func (r *Runner) Stop() {
 	}
 	if cancel != nil {
 		cancel()
+	}
+	if video != nil {
+		_ = video.Close()
 	}
 	if srv != nil {
 		srv.Stop()
@@ -248,6 +290,7 @@ func (r *Runner) Stop() {
 	}
 	r.cancel = nil
 	r.srv = nil
+	r.video = nil
 	r.mu.Unlock()
 	slog.Info("界面：设备已停止")
 }
@@ -285,21 +328,39 @@ func toDevice(cfg appconfig.Config) (device.Config, device.DeviceInfo, error) {
 	}, nil
 }
 
-func syntheticAU(i int) device.AccessUnit {
-	au := device.AccessUnit{
-		Timestamp: time.Now(),
-		KeyFrame:  i%5 == 0,
+func resolveVideo(cfg appconfig.Config) (videosrc.Backend, videosrc.Device, error) {
+	backendID := strings.ToLower(strings.TrimSpace(cfg.VideoBackend))
+	if backendID == "" {
+		backendID = videosrc.BackendSynthetic
 	}
-	if au.KeyFrame {
-		au.NALUs = []device.NALU{
-			{Type: 7, IsSPS: true, Data: []byte{0x67, 0x42}},
-			{Type: 8, IsPPS: true, Data: []byte{0x68, 0xEB}},
-			{Type: 5, IsIDR: true, Data: []byte{0x65, 0x01}},
+	backend, ok := videosrc.Lookup(backendID)
+	if !ok {
+		return nil, videosrc.Device{}, fmt.Errorf("未知的视频源类型：%s", backendID)
+	}
+	if err := backend.Available(); err != nil {
+		return nil, videosrc.Device{}, err
+	}
+	dev := videosrc.Device{
+		ID:   strings.TrimSpace(cfg.CameraID),
+		Name: strings.TrimSpace(cfg.CameraName),
+	}
+	if backend.ID() == videosrc.BackendFFmpeg && dev.ID == "" && dev.Name == "" {
+		return nil, dev, fmt.Errorf("请先选择一个摄像头，或点击「刷新」扫描本机设备")
+	}
+	return backend, dev, nil
+}
+
+func logVideoStart(backend videosrc.Backend, dev videosrc.Device) {
+	switch backend.ID() {
+	case videosrc.BackendFFmpeg:
+		name := dev.Name
+		if name == "" {
+			name = dev.ID
 		}
-	} else {
-		au.NALUs = []device.NALU{{Type: 1, Data: []byte{0x41, 0x02}}}
+		slog.Info("界面：使用 FFmpeg 采集本机摄像头", "camera", name, "backend", backend.ID())
+	default:
+		slog.Info("界面：视频为库内合成的占位 H.264 帧（每秒一帧，每 5 帧一个 IDR），不是 RTSP 实况")
 	}
-	return au
 }
 
 func formatValidate(err error) error {

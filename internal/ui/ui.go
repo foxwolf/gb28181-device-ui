@@ -29,6 +29,7 @@ import (
 	"gb28181-device-ui/internal/localip"
 	"gb28181-device-ui/internal/logview"
 	"gb28181-device-ui/internal/runner"
+	"gb28181-device-ui/internal/videosrc"
 )
 
 type (
@@ -51,6 +52,16 @@ type UI struct {
 	registerInterval, heartbeatInterval            widget.Editor
 	transport                                      widget.Enum
 	showPassword                                   widget.Bool
+	backend                                        widget.Enum
+	refreshCamBtn, camBtn                          widget.Clickable
+	camOpen                                        bool
+	camClicks                                      []widget.Clickable
+	lastBackend                                    string
+	cameras                                        []videosrc.Device
+	camErr                                         string
+	camScanning                                    bool
+	camPick                                        *videosrc.Device
+	selectedCam                                    videosrc.Device
 
 	startBtn, stopBtn, saveBtn, loadBtn, exitBtn widget.Clickable
 
@@ -90,6 +101,7 @@ func New() *UI {
 	u.heartbeatInterval.Filter = digits
 	u.password.Mask = '●'
 	u.transport.Value = "udp"
+	u.backend.Value = videosrc.BackendSynthetic
 	return u
 }
 
@@ -131,8 +143,8 @@ func (u *UI) Run() error {
 	w := new(app.Window)
 	w.Option(
 		app.Title("GB28181 设备模拟器"),
-		app.Size(unit.Dp(1120), unit.Dp(800)),
-		app.MinSize(unit.Dp(880), unit.Dp(620)),
+		app.Size(unit.Dp(1120), unit.Dp(860)),
+		app.MinSize(unit.Dp(880), unit.Dp(680)),
 	)
 	u.win = w
 	u.refreshLocalIP(true)
@@ -182,6 +194,15 @@ func (u *UI) applyConfig(cfg appconfig.Config) {
 		t = "udp"
 	}
 	u.transport.Value = t
+	vb := strings.ToLower(strings.TrimSpace(cfg.VideoBackend))
+	if vb == "" {
+		vb = videosrc.BackendSynthetic
+	}
+	u.backend.Value = vb
+	u.selectedCam = videosrc.Device{ID: cfg.CameraID, Name: cfg.CameraName}
+	if vb == videosrc.BackendFFmpeg {
+		u.refreshCameras()
+	}
 }
 
 func (u *UI) readConfig() appconfig.Config {
@@ -207,6 +228,12 @@ func (u *UI) readConfig() appconfig.Config {
 	if v, err := strconv.Atoi(strings.TrimSpace(u.heartbeatInterval.Text())); err == nil {
 		cfg.HeartbeatIntervalSecs = v
 	}
+	cfg.VideoBackend = u.backend.Value
+	if cfg.VideoBackend == "" {
+		cfg.VideoBackend = videosrc.BackendSynthetic
+	}
+	cfg.CameraID = u.selectedCam.ID
+	cfg.CameraName = u.selectedCam.Name
 	return cfg
 }
 
@@ -249,6 +276,8 @@ func (u *UI) frame(gtx C) {
 		u.win.Perform(system.ActionClose)
 	}
 
+	u.handleCameraInput(gtx, running)
+
 	paint.Fill(gtx.Ops, rgb(0xF4F6F8))
 	layout.UniformInset(unit.Dp(14)).Layout(gtx, func(gtx C) D {
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
@@ -282,7 +311,7 @@ func (u *UI) header(gtx C) D {
 		}),
 		layout.Rigid(gap(4)),
 		layout.Rigid(func(gtx C) D {
-			l := material.Label(u.th, unit.Sp(13), "基于 gb28181-go 设备侧（UAC）库。视频为库内合成的占位画面，不是 RTSP 实况（与 EasyGBD 不同）。")
+			l := material.Label(u.th, unit.Sp(13), "基于 gb28181-go 设备侧（UAC）库。可选择本机摄像头（FFmpeg）或合成占位画面。")
 			l.Color = rgb(0x9A5B00)
 			return l.Layout(gtx)
 		}),
@@ -316,6 +345,10 @@ func (u *UI) form(gtx C) D {
 				layout.Flexed(1, u.miniRow("心跳间隔(秒)", &u.heartbeatInterval)),
 			)
 		}),
+		layout.Rigid(gap(8)),
+		layout.Rigid(u.sourceRow),
+		layout.Rigid(u.cameraRow),
+		layout.Rigid(u.ffmpegHint),
 		layout.Rigid(gap(12)),
 		layout.Rigid(func(gtx C) D {
 			return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
@@ -372,6 +405,296 @@ func (u *UI) transportRow(gtx C) D {
 			return material.RadioButton(u.th, &u.transport, "tcp", "TCP").Layout(gtx)
 		}),
 	)
+}
+
+func (u *UI) sourceRow(gtx C) D {
+	running := u.run.Running()
+	return layout.Inset{Top: unit.Dp(3), Bottom: unit.Dp(3)}.Layout(gtx, func(gtx C) D {
+		return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+			layout.Rigid(func(gtx C) D {
+				gtx.Constraints.Min.X = gtx.Dp(unit.Dp(108))
+				gtx.Constraints.Max.X = gtx.Dp(unit.Dp(108))
+				return material.Label(u.th, unit.Sp(13), "视频源").Layout(gtx)
+			}),
+			layout.Rigid(func(gtx C) D {
+				if running {
+					gtx = gtx.Disabled()
+				}
+				return material.RadioButton(u.th, &u.backend, videosrc.BackendSynthetic, "合成占位画面").Layout(gtx)
+			}),
+			layout.Rigid(func(gtx C) D { return layout.Spacer{Width: unit.Dp(12)}.Layout(gtx) }),
+			layout.Rigid(func(gtx C) D {
+				if running {
+					gtx = gtx.Disabled()
+				}
+				return material.RadioButton(u.th, &u.backend, videosrc.BackendFFmpeg, "本机摄像头（FFmpeg）").Layout(gtx)
+			}),
+		)
+	})
+}
+
+func (u *UI) cameraRow(gtx C) D {
+	running := u.run.Running()
+	ffmpeg := u.backend.Value == videosrc.BackendFFmpeg
+	enabled := !running && ffmpeg
+	return layout.Inset{Top: unit.Dp(3), Bottom: unit.Dp(3)}.Layout(gtx, func(gtx C) D {
+		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			layout.Rigid(func(gtx C) D {
+				return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+					layout.Rigid(func(gtx C) D {
+						gtx.Constraints.Min.X = gtx.Dp(unit.Dp(108))
+						gtx.Constraints.Max.X = gtx.Dp(unit.Dp(108))
+						return material.Label(u.th, unit.Sp(13), "摄像头").Layout(gtx)
+					}),
+					layout.Flexed(1, func(gtx C) D {
+						if !enabled {
+							gtx = gtx.Disabled()
+						}
+						return u.cameraCombo(gtx, enabled)
+					}),
+					layout.Rigid(func(gtx C) D { return layout.Spacer{Width: unit.Dp(8)}.Layout(gtx) }),
+					layout.Rigid(u.btn(&u.refreshCamBtn, "刷新", rgb(0x455A64), enabled)),
+				)
+			}),
+			layout.Rigid(func(gtx C) D {
+				if !u.camOpen || !enabled {
+					return D{}
+				}
+				return u.cameraMenu(gtx)
+			}),
+		)
+	})
+}
+
+func (u *UI) cameraCombo(gtx C, enabled bool) D {
+	return widget.Border{
+		Color:        rgb(0xD0D5DD),
+		CornerRadius: unit.Dp(4),
+		Width:        unit.Dp(1),
+	}.Layout(gtx, func(gtx C) D {
+		return u.camBtn.Layout(gtx, func(gtx C) D {
+			return layout.Inset{Top: unit.Dp(5), Bottom: unit.Dp(5), Left: unit.Dp(8), Right: unit.Dp(8)}.Layout(gtx, func(gtx C) D {
+				label := u.cameraLabel()
+				return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+					layout.Flexed(1, func(gtx C) D {
+						l := material.Label(u.th, unit.Sp(13), label)
+						if !enabled {
+							l.Color = rgb(0x9AA3AD)
+						}
+						l.MaxLines = 1
+						return l.Layout(gtx)
+					}),
+					layout.Rigid(func(gtx C) D {
+						mark := "▾"
+						if u.camOpen && enabled {
+							mark = "▴"
+						}
+						l := material.Label(u.th, unit.Sp(13), mark)
+						l.Color = rgb(0x616E7C)
+						return l.Layout(gtx)
+					}),
+				)
+			})
+		})
+	})
+}
+
+func (u *UI) cameraMenu(gtx C) D {
+	u.mu.Lock()
+	cams := append([]videosrc.Device(nil), u.cameras...)
+	u.mu.Unlock()
+	if len(cams) == 0 {
+		return layout.Inset{Top: unit.Dp(4), Left: unit.Dp(108)}.Layout(gtx, func(gtx C) D {
+			l := material.Label(u.th, unit.Sp(12), "没有可选择的摄像头")
+			l.Color = rgb(0x616E7C)
+			return l.Layout(gtx)
+		})
+	}
+	if len(u.camClicks) != len(cams) {
+		u.camClicks = make([]widget.Clickable, len(cams))
+	}
+	children := make([]layout.FlexChild, 0, len(cams))
+	for i := range cams {
+		i := i
+		children = append(children, layout.Rigid(func(gtx C) D {
+			return u.camClicks[i].Layout(gtx, func(gtx C) D {
+				return layout.Inset{Top: unit.Dp(4), Bottom: unit.Dp(4), Left: unit.Dp(8), Right: unit.Dp(8)}.Layout(gtx, func(gtx C) D {
+					l := material.Label(u.th, unit.Sp(13), cams[i].Name)
+					if u.selectedCam.ID == cams[i].ID && cams[i].ID != "" {
+						l.Font.Weight = font.SemiBold
+						l.Color = rgb(0x1565C0)
+					}
+					return l.Layout(gtx)
+				})
+			})
+		}))
+	}
+	return layout.Inset{Top: unit.Dp(4), Left: unit.Dp(108)}.Layout(gtx, func(gtx C) D {
+		return widget.Border{
+			Color:        rgb(0xD0D5DD),
+			CornerRadius: unit.Dp(4),
+			Width:        unit.Dp(1),
+		}.Layout(gtx, func(gtx C) D {
+			return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+		})
+	})
+}
+
+func (u *UI) cameraLabel() string {
+	if u.backend.Value != videosrc.BackendFFmpeg {
+		return "（合成占位，无需选择摄像头）"
+	}
+	u.mu.Lock()
+	scanning := u.camScanning
+	u.mu.Unlock()
+	if scanning && u.selectedCam.Name == "" && u.selectedCam.ID == "" {
+		return "正在扫描摄像头…"
+	}
+	if u.selectedCam.Name != "" {
+		return u.selectedCam.Name
+	}
+	if u.selectedCam.ID != "" {
+		return u.selectedCam.ID
+	}
+	return "请选择摄像头"
+}
+
+func (u *UI) ffmpegHint(gtx C) D {
+	msg, warn := u.videoHint()
+	if msg == "" {
+		return D{}
+	}
+	return layout.Inset{Top: unit.Dp(4), Left: unit.Dp(108)}.Layout(gtx, func(gtx C) D {
+		l := material.Label(u.th, unit.Sp(12), msg)
+		if warn {
+			l.Color = rgb(0x9A5B00)
+		} else {
+			l.Color = rgb(0x616E7C)
+		}
+		return l.Layout(gtx)
+	})
+}
+
+func (u *UI) videoHint() (string, bool) {
+	if u.backend.Value != videosrc.BackendFFmpeg {
+		return "", false
+	}
+	if b, ok := videosrc.Lookup(videosrc.BackendFFmpeg); ok {
+		if err := b.Available(); err != nil {
+			return "未找到 ffmpeg.exe。请将它放到本程序同一目录，或加入系统 PATH。", true
+		}
+	}
+	u.mu.Lock()
+	scanning, errText, n := u.camScanning, u.camErr, len(u.cameras)
+	u.mu.Unlock()
+	if scanning {
+		return "正在扫描本机摄像头…", false
+	}
+	if errText != "" {
+		return errText, true
+	}
+	if n == 0 {
+		return "未扫描到摄像头。请确认已安装摄像头驱动，并点击「刷新」。", true
+	}
+	return "将通过 FFmpeg 采集选中的本机摄像头。", false
+}
+
+func (u *UI) handleCameraInput(gtx C, running bool) {
+	u.mu.Lock()
+	if u.camPick != nil {
+		u.selectedCam = *u.camPick
+		u.camPick = nil
+	}
+	u.mu.Unlock()
+
+	if u.refreshCamBtn.Clicked(gtx) && !running && u.backend.Value == videosrc.BackendFFmpeg {
+		u.refreshCameras()
+	}
+	if u.backend.Value == videosrc.BackendFFmpeg && u.lastBackend != videosrc.BackendFFmpeg {
+		u.refreshCameras()
+	}
+	u.lastBackend = u.backend.Value
+	if u.backend.Value != videosrc.BackendFFmpeg || running {
+		u.camOpen = false
+	} else if u.camBtn.Clicked(gtx) {
+		u.camOpen = !u.camOpen
+	}
+
+	u.mu.Lock()
+	cams := append([]videosrc.Device(nil), u.cameras...)
+	u.mu.Unlock()
+	if len(u.camClicks) != len(cams) {
+		u.camClicks = make([]widget.Clickable, len(cams))
+	}
+	if !running && u.camOpen {
+		for i := range u.camClicks {
+			if i < len(cams) && u.camClicks[i].Clicked(gtx) {
+				u.selectedCam = cams[i]
+				u.camOpen = false
+			}
+		}
+	}
+}
+
+func (u *UI) refreshCameras() {
+	u.mu.Lock()
+	if u.camScanning {
+		u.mu.Unlock()
+		return
+	}
+	u.camScanning = true
+	u.camErr = ""
+	u.mu.Unlock()
+	sel := u.selectedCam
+	if u.win != nil {
+		u.win.Invalidate()
+	}
+	go func() {
+		defer func() {
+			u.mu.Lock()
+			u.camScanning = false
+			u.mu.Unlock()
+			if u.win != nil {
+				u.win.Invalidate()
+			}
+		}()
+		b, ok := videosrc.Lookup(videosrc.BackendFFmpeg)
+		if !ok {
+			u.mu.Lock()
+			u.camErr = "未登记 FFmpeg 视频源"
+			u.mu.Unlock()
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		devs, err := b.Devices(ctx)
+		u.mu.Lock()
+		defer u.mu.Unlock()
+		if err != nil {
+			u.camErr = err.Error()
+			return
+		}
+		u.cameras = devs
+		u.camErr = ""
+		var pick *videosrc.Device
+		if sel.ID != "" || sel.Name != "" {
+			for i := range devs {
+				d := devs[i]
+				if (sel.ID != "" && d.ID == sel.ID) || d.Name == sel.Name || (sel.ID != "" && d.Name == sel.ID) {
+					dd := d
+					pick = &dd
+					break
+				}
+			}
+		}
+		if pick == nil && len(devs) > 0 && sel.ID == "" && sel.Name == "" {
+			dd := devs[0]
+			pick = &dd
+		}
+		if pick != nil {
+			u.camPick = pick
+		}
+	}()
 }
 
 func (u *UI) row(label string, ed *widget.Editor, hint string) layout.Widget {

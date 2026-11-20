@@ -1,0 +1,121 @@
+package videosrc
+
+import (
+	"regexp"
+	"strings"
+	"unicode/utf8"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
+)
+
+var (
+	dshowNameRe = regexp.MustCompile(`\[dshow @ [^\]]*\]\s+"([^"]+)"`)
+	dshowAltRe  = regexp.MustCompile(`\[dshow @ [^\]]*\]\s+Alternative name\s+"([^"]+)"`)
+)
+
+// parseDShowDevices 从 ffmpeg -list_devices 的 stderr 中解析 DirectShow 视频设备。
+// 忽略音频设备。优先把 Alternative name 作为 Device.ID。
+func parseDShowDevices(output string) []Device {
+	videoSection := false
+	seenSection := false
+	var out []Device
+	var cur *Device
+
+	flush := func() {
+		if cur == nil {
+			return
+		}
+		if cur.ID == "" {
+			cur.ID = cur.Name
+		}
+		if cur.Name == "" {
+			cur.Name = cur.ID
+		}
+		out = append(out, *cur)
+		cur = nil
+	}
+
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(strings.TrimSuffix(raw, "\r"))
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+
+		if strings.Contains(lower, "directshow video devices") {
+			flush()
+			videoSection = true
+			seenSection = true
+			continue
+		}
+		if strings.Contains(lower, "directshow audio devices") {
+			flush()
+			videoSection = false
+			seenSection = true
+			continue
+		}
+
+		if alt := dshowAltRe.FindStringSubmatch(line); len(alt) == 2 {
+			if cur != nil {
+				cur.ID = alt[1]
+			}
+			continue
+		}
+
+		if name := dshowNameRe.FindStringSubmatch(line); len(name) == 2 {
+			// 无章节标题时，用 "(audio)" / "(video)" 兜底；默认当作视频。
+			isAudio := strings.Contains(lower, "(audio)")
+			isVideo := strings.Contains(lower, "(video)")
+			inVideo := videoSection
+			if !seenSection {
+				inVideo = !isAudio
+			} else if isAudio && !isVideo {
+				inVideo = false
+			} else if isVideo {
+				inVideo = true
+			}
+			flush()
+			if !inVideo {
+				continue
+			}
+			cur = &Device{Name: name[1], ID: name[1]}
+			continue
+		}
+	}
+	flush()
+	return out
+}
+
+// dshowVideoInput 构造传给 ffmpeg -i 的单个参数（含 video= 与必要引号）。
+func dshowVideoInput(id string) string {
+	return "video=" + dshowQuote(strings.TrimSpace(id))
+}
+
+// dshowQuote 把设备名包进双引号，以便 ffmpeg 的 dshow 选项解析能处理空格、逗号、中文名等。
+func dshowQuote(id string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range id {
+		if r == '"' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// decodeFFmpegOutput 把 ffmpeg 的输出转成字符串。
+// 管道里在中文 Windows 上有时是系统 ANSI（GBK）而不是 UTF-8。
+func decodeFFmpegOutput(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	if utf8.Valid(b) {
+		return string(b)
+	}
+	if s, err := simplifiedchinese.GBK.NewDecoder().Bytes(b); err == nil && utf8.Valid(s) {
+		return string(s)
+	}
+	return string(b)
+}

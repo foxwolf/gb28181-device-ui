@@ -27,6 +27,9 @@ func TestDefaultsHaveNoPassword(t *testing.T) {
 	if d.Transport != "udp" || d.RegisterIntervalSecs != 3600 || d.HeartbeatIntervalSecs != 60 {
 		t.Fatalf("unexpected intervals: %+v", d)
 	}
+	if d.VideoBackend != "synthetic" || d.CameraID != "" || d.CameraName != "" {
+		t.Fatalf("unexpected video defaults: %+v", d)
+	}
 }
 
 func TestSaveLoadRoundTrip(t *testing.T) {
@@ -35,6 +38,9 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	cfg := Defaults()
 	cfg.Password = "unit-test-secret"
 	cfg.Name = "roundtrip"
+	cfg.VideoBackend = "ffmpeg"
+	cfg.CameraID = "@device_pnp_abc"
+	cfg.CameraName = "Integrated Camera"
 	if err := Save(path, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -44,6 +50,9 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 	if got.Password != "unit-test-secret" || got.Name != "roundtrip" {
 		t.Fatalf("round trip mismatch: %+v", got)
+	}
+	if got.VideoBackend != "ffmpeg" || got.CameraID != "@device_pnp_abc" || got.CameraName != "Integrated Camera" {
+		t.Fatalf("video fields mismatch: %+v", got)
 	}
 }
 
@@ -67,6 +76,9 @@ func TestNormalizeFillsEmpty(t *testing.T) {
 	}
 	if cfg.Password != "x" {
 		t.Fatal("normalize must keep password")
+	}
+	if cfg.VideoBackend != "synthetic" {
+		t.Fatalf("normalize should default video backend: %+v", cfg)
 	}
 }
 

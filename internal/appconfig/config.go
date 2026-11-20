@@ -27,6 +27,10 @@ type Config struct {
 	Transport             string `json:"transport"`
 	RegisterIntervalSecs  int    `json:"register_interval_secs"`
 	HeartbeatIntervalSecs int    `json:"heartbeat_interval_secs"`
+	// VideoBackend 是采集后端 ID：synthetic（默认）或 ffmpeg。日后可扩展 native。
+	VideoBackend string `json:"video_backend,omitempty"`
+	CameraID     string `json:"camera_id,omitempty"`
+	CameraName   string `json:"camera_name,omitempty"`
 }
 
 // Defaults 返回不含密码的非敏感测试默认值（与当前 EasyGBD / sdsipsignal 联调一致）。
@@ -45,6 +49,7 @@ func Defaults() Config {
 		Transport:             "udp",
 		RegisterIntervalSecs:  3600,
 		HeartbeatIntervalSecs: 60,
+		VideoBackend:          "synthetic",
 	}
 }
 
@@ -171,4 +176,10 @@ func (c *Config) normalize() {
 	if c.HeartbeatIntervalSecs <= 0 {
 		c.HeartbeatIntervalSecs = d.HeartbeatIntervalSecs
 	}
+	c.VideoBackend = strings.ToLower(strings.TrimSpace(c.VideoBackend))
+	if c.VideoBackend == "" {
+		c.VideoBackend = d.VideoBackend
+	}
+	c.CameraID = strings.TrimSpace(c.CameraID)
+	c.CameraName = strings.TrimSpace(c.CameraName)
 }
