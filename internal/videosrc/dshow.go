@@ -89,23 +89,14 @@ func parseDShowDevices(output string) []Device {
 	return out
 }
 
-// dshowVideoInput 构造传给 ffmpeg -i 的单个参数（含 video= 与必要引号）。
+// dshowVideoInput 构造传给 ffmpeg -i 的单个参数。
+// 由 os/exec 作为独立参数传递，不再额外加引号：FFmpeg 8 会把引号当成设备名的一部分，从而导致打不开摄像头。
 func dshowVideoInput(id string) string {
-	return "video=" + dshowQuote(strings.TrimSpace(id))
-}
-
-// dshowQuote 把设备名包进双引号，以便 ffmpeg 的 dshow 选项解析能处理空格、逗号、中文名等。
-func dshowQuote(id string) string {
-	var b strings.Builder
-	b.WriteByte('"')
-	for _, r := range id {
-		if r == '"' {
-			b.WriteByte('\\')
-		}
-		b.WriteRune(r)
+	id = strings.TrimSpace(id)
+	if len(id) >= 2 && id[0] == '"' && id[len(id)-1] == '"' {
+		id = id[1 : len(id)-1]
 	}
-	b.WriteByte('"')
-	return b.String()
+	return "video=" + id
 }
 
 // decodeFFmpegOutput 把 ffmpeg 的输出转成字符串。

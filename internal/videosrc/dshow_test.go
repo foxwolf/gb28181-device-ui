@@ -113,21 +113,26 @@ func TestParseDShowDevices_VideoTagWithoutSection(t *testing.T) {
 
 func TestDShowQuoteAndInput(t *testing.T) {
 	got := dshowVideoInput(`Integrated Camera`)
-	if got != `video="Integrated Camera"` {
+	if got != `video=Integrated Camera` {
 		t.Fatalf("spaces: %q", got)
 	}
 	got = dshowVideoInput(`Cam, Front`)
-	if got != `video="Cam, Front"` {
+	if got != `video=Cam, Front` {
 		t.Fatalf("comma: %q", got)
 	}
 	alt := `@device_pnp_\\?\usb#vid_04f2&pid_b67c`
 	got = dshowVideoInput(alt)
-	if got != `video="`+alt+`"` {
-		t.Fatalf("alt: got %q want quoted original name", got)
+	if got != `video=`+alt {
+		t.Fatalf("alt: got %q", got)
 	}
+	// os/exec 按参数传递，名字里的引号应保留为设备名的一部分，但不要再外包一层引号。
 	got = dshowVideoInput(`say "hi"`)
-	if got != `video="say \"hi\""` {
+	if got != `video=say "hi"` {
 		t.Fatalf("quotes: %q", got)
+	}
+	got = dshowVideoInput(`"@device_pnp_abc"`)
+	if got != `video=@device_pnp_abc` {
+		t.Fatalf("strip wrapping quotes: %q", got)
 	}
 }
 
@@ -157,12 +162,12 @@ func TestCaptureArgsDefaultCommand(t *testing.T) {
 		"-bf", "0",
 		"-g", "25",
 		"-keyint_min", "25",
-	})
+	}, 0)
 	got := strings.Join(args, " ")
 	wantParts := []string{
 		"-hide_banner", "-nostdin", "-loglevel error",
 		"-f dshow", "-rtbufsize 100M",
-		`-i video="@device_pnp_abc"`,
+		`-i video=@device_pnp_abc`,
 		"-an", "-pix_fmt yuv420p",
 		"-c:v libx264", "-preset veryfast", "-tune zerolatency",
 		"-profile:v baseline", "-bf 0", "-g 25", "-keyint_min 25",
@@ -201,7 +206,7 @@ func TestRegistryListsSyntheticAndFFmpeg(t *testing.T) {
 
 func TestDShowQuoteChinese(t *testing.T) {
 	got := dshowVideoInput("USB 摄像头")
-	if got != `video="USB 摄像头"` {
+	if got != `video=USB 摄像头` {
 		t.Fatalf("%q", got)
 	}
 }
