@@ -108,8 +108,35 @@ func centerOnCursorMonitor(hwnd uintptr) {
 		return
 	}
 	area := mi.Work
+	const margin int32 = 8
+	maxW := area.Right - area.Left - margin*2
+	maxH := area.Bottom - area.Top - margin*2
+	if maxW < 200 {
+		maxW = area.Right - area.Left
+	}
+	if maxH < 200 {
+		maxH = area.Bottom - area.Top
+	}
+	if dx > maxW {
+		dx = maxW
+	}
+	if dy > maxH {
+		dy = maxH
+	}
 	x := (area.Right + area.Left - dx) / 2
 	y := (area.Bottom + area.Top - dy) / 2
+	if x < area.Left+margin {
+		x = area.Left + margin
+	}
+	if y < area.Top+margin {
+		y = area.Top + margin
+	}
+	if x+dx > area.Right-margin {
+		x = area.Right - margin - dx
+	}
+	if y+dy > area.Bottom-margin {
+		y = area.Bottom - margin - dy
+	}
 	procSetWindowPos.Call(
 		hwnd,
 		0,
