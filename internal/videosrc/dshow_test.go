@@ -74,6 +74,31 @@ func TestParseDShowDevices_EmptyOrNone(t *testing.T) {
 	}
 }
 
+func TestParseDShowDevices_FFmpeg8InPrefix(t *testing.T) {
+	// FFmpeg 8.x 的 -list_devices 不再使用 [dshow @ ...] 和章节标题。
+	in := `[in#0 @ 000001e607454dc0] "HD Camera" (video)
+[in#0 @ 000001e607454dc0]   Alternative name "@device_pnp_\\?\usb#vid_5858&pid_133a&mi_00#6&abcd&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global"
+[in#0 @ 000001e607454dc0] "ToDesk Camera" (video)
+[in#0 @ 000001e607454dc0]   Alternative name "@device_sw_{860BB310-5D01-11D0-BD3B-00A0C911CE86}\{8A9B8FA2-8893-4C7D-9385-A22AF40A37B0}"
+[in#0 @ 000001e607454dc0] "本机麦克风 (适用于数字麦克风的英特尔智音技术)" (audio)
+[in#0 @ 000001e607454dc0]   Alternative name "@device_cm_{33D9A762-90C8-11D0-BD43-00A0C911CE86}\wave_{C597104B-A065-47E3-AAA8-4B9D77EB0BD1}"
+[in#0 @ 000001e607454dc0] "麦克风 (ToDesk Virtual Audio)" (audio)
+[in#0 @ 000001e607454dc0]   Alternative name "@device_cm_{33D9A762-90C8-11D0-BD43-00A0C911CE86}\wave_{325CBC5A-9EE8-4F34-B7F4-9BC7CEA85AAD}"
+Error opening input file dummy.
+Error opening input files: Invalid argument
+`
+	devs := parseDShowDevices(in)
+	if len(devs) != 2 {
+		t.Fatalf("got %d devices: %+v", len(devs), devs)
+	}
+	if devs[0].Name != "HD Camera" || !strings.HasPrefix(devs[0].ID, "@device_pnp_") {
+		t.Fatalf("dev[0]=%+v", devs[0])
+	}
+	if devs[1].Name != "ToDesk Camera" || !strings.HasPrefix(devs[1].ID, "@device_sw_") {
+		t.Fatalf("dev[1]=%+v", devs[1])
+	}
+}
+
 func TestParseDShowDevices_VideoTagWithoutSection(t *testing.T) {
 	in := `[dshow @ 1] "HD WebCam" (video)
 [dshow @ 1]     Alternative name "@device_pnp_\\?\usb#vid_abcd"

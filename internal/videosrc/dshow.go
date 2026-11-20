@@ -8,9 +8,12 @@ import (
 	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
+// FFmpeg 7 及更早在列表里用 [dshow @ ...]；FFmpeg 8 改为 [in#0 @ ...]。
+const dshowLogPrefix = `\[(?:dshow|in#\d+) @ [^\]]*\]`
+
 var (
-	dshowNameRe = regexp.MustCompile(`\[dshow @ [^\]]*\]\s+"([^"]+)"`)
-	dshowAltRe  = regexp.MustCompile(`\[dshow @ [^\]]*\]\s+Alternative name\s+"([^"]+)"`)
+	dshowNameRe = regexp.MustCompile(dshowLogPrefix + `\s+"([^"]+)"`)
+	dshowAltRe  = regexp.MustCompile(dshowLogPrefix + `\s+Alternative name\s+"([^"]+)"`)
 )
 
 // parseDShowDevices 从 ffmpeg -list_devices 的 stderr 中解析 DirectShow 视频设备。
