@@ -8,12 +8,12 @@ import (
 	"unicode/utf8"
 
 	"gioui.org/font"
-	"gioui.org/gesture"
 	"gioui.org/io/clipboard"
 	"gioui.org/io/event"
 	"gioui.org/io/key"
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
+	"gioui.org/op"
 	"gioui.org/op/clip"
 	"gioui.org/op/paint"
 	"gioui.org/text"
@@ -49,6 +49,7 @@ type lineHit struct {
 }
 
 func (u *UI) layoutLogText(gtx C) D {
+	// 先根据上一帧行位置处理指针，本帧绘制就能跟上拖动。
 	u.processLogPointer(gtx)
 	u.processLogKeys(gtx)
 
@@ -96,13 +97,10 @@ func (u *UI) layoutLogText(gtx C) D {
 		u.stickBottom = !u.logList.Position.BeforeEnd
 	}
 
-	// 在视口上接收划选，坐标始终相对日志窗口，不再经过 List 子项的位移变换。
 	defer pointer.PassOp{}.Push(gtx.Ops).Pop()
 	defer clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops).Pop()
 	pointer.CursorText.Add(gtx.Ops)
-	event.Op(gtx.Ops, &u.logClick)
-	u.logClick.Add(gtx.Ops)
-	u.logDrag.Add(gtx.Ops)
+	event.Op(gtx.Ops, &u.logPtr)
 	return dims
 }
 
@@ -130,38 +128,72 @@ func (u *UI) layoutLogLine(gtx C, i int, line logview.Line) D {
 	return layout.Inset{Bottom: unit.Dp(2)}.Layout(gtx, l.Layout)
 }
 
-func (u *UI) processLogPointer(gtx C) {
+func (u *UI) processWinPointer(gtx C) {
 	for {
-		e, ok := u.logClick.Update(gtx.Source)
+		ev, ok := gtx.Event(pointer.Filter{
+			Target: &u.winPtr,
+			Kinds:  pointer.Press | pointer.Drag | pointer.Release | pointer.Cancel,
+		})
 		if !ok {
 			break
 		}
-		if e.Kind == gesture.KindPress && e.Source == pointer.Mouse {
-			p := u.posAt(gtx, e.Position)
+		e, ok := ev.(pointer.Event)
+		if !ok {
+			continue
+		}
+		if e.Kind == pointer.Press || e.Kind == pointer.Release {
+			if e.Kind == pointer.Press && e.Source == pointer.Mouse && e.Buttons != pointer.ButtonPrimary {
+				continue
+			}
+			u.winPress = e.Position.Round()
+			u.haveWinPress = true
+		}
+	}
+}
+
+func (u *UI) processLogPointer(gtx C) {
+	for {
+		ev, ok := gtx.Event(pointer.Filter{
+			Target: &u.logPtr,
+			Kinds:  pointer.Press | pointer.Drag | pointer.Release | pointer.Cancel,
+		})
+		if !ok {
+			break
+		}
+		e, ok := ev.(pointer.Event)
+		if !ok {
+			continue
+		}
+		pt := e.Position.Round()
+		switch e.Kind {
+		case pointer.Press:
+			if e.Source == pointer.Mouse && e.Buttons != pointer.ButtonPrimary {
+				continue
+			}
+			u.logPressLocal = pt
+			if u.haveWinPress {
+				u.logOrigin = u.winPress.Sub(pt)
+				u.haveLogOrigin = true
+			} else {
+				u.haveLogOrigin = false
+			}
+			p := u.posAt(gtx, pt)
 			u.logStart, u.logEnd = p, p
 			u.logDragging = true
 			u.logFocused = true
-			gtx.Execute(key.FocusCmd{Tag: &u.logClick})
-		}
-	}
-	for {
-		e, ok := u.logDrag.Update(gtx.Metric, gtx.Source, gesture.Both)
-		if !ok {
-			break
-		}
-		if !u.logDragging {
-			if e.Kind == pointer.Press && e.Source == pointer.Mouse {
-				p := u.posAt(gtx, e.Position.Round())
-				u.logStart, u.logEnd = p, p
-				u.logDragging = true
-				u.logFocused = true
-				gtx.Execute(key.FocusCmd{Tag: &u.logClick})
-			}
-			continue
-		}
-		switch e.Kind {
+			gtx.Execute(key.FocusCmd{Tag: &u.logPtr})
+			gtx.Execute(pointer.GrabCmd{Tag: &u.logPtr, ID: e.PointerID})
 		case pointer.Drag, pointer.Release:
-			u.logEnd = u.posAt(gtx, e.Position.Round())
+			if !u.logDragging {
+				continue
+			}
+			if e.Kind == pointer.Release && !nearOrigin(pt) {
+				u.logEnd = u.posAt(gtx, pt)
+			} else if lp, ok := u.cursorLogPoint(); ok {
+				u.logEnd = u.posAt(gtx, lp)
+			} else if e.Kind == pointer.Release || !nearOrigin(pt) {
+				u.logEnd = u.posAt(gtx, pt)
+			}
 			if e.Kind == pointer.Release {
 				u.logDragging = false
 			}
@@ -169,14 +201,40 @@ func (u *UI) processLogPointer(gtx C) {
 			u.logDragging = false
 		}
 	}
+	if u.logDragging {
+		if lp, ok := u.cursorLogPoint(); ok {
+			u.logEnd = u.posAt(gtx, lp)
+		}
+		gtx.Execute(op.InvalidateCmd{})
+	}
+}
+
+// cursorLogPoint 用窗口客户区光标减去日志视口原点，避免“按下时记下的屏幕坐标已经落后一截”。
+func (u *UI) cursorLogPoint() (image.Point, bool) {
+	if !u.haveLogOrigin {
+		return image.Point{}, false
+	}
+	c, ok := clientCursor(u.hwnd)
+	if !ok {
+		return image.Point{}, false
+	}
+	if cs, ok := windowClientSize(u.hwnd); ok && cs.X > 0 && cs.Y > 0 && u.frameSize.X > 0 && u.frameSize.Y > 0 && cs != u.frameSize {
+		c.X = c.X * u.frameSize.X / cs.X
+		c.Y = c.Y * u.frameSize.Y / cs.Y
+	}
+	return c.Sub(u.logOrigin), true
+}
+
+func nearOrigin(p image.Point) bool {
+	return p.X < 8 && p.Y < 8
 }
 
 func (u *UI) processLogKeys(gtx C) {
 	for {
 		ev, ok := gtx.Event(
-			key.FocusFilter{Target: &u.logClick},
-			key.Filter{Focus: &u.logClick, Name: "C", Required: key.ModShortcut},
-			key.Filter{Focus: &u.logClick, Name: "A", Required: key.ModShortcut},
+			key.FocusFilter{Target: &u.logPtr},
+			key.Filter{Focus: &u.logPtr, Name: "C", Required: key.ModShortcut},
+			key.Filter{Focus: &u.logPtr, Name: "A", Required: key.ModShortcut},
 		)
 		if !ok {
 			break
@@ -239,23 +297,27 @@ func (u *UI) runeAt(gtx C, s string, local image.Point, maxW int) int {
 		return 0
 	}
 	glyphs := u.shapeLog(gtx, s, maxW)
-	best := 0
+	if len(glyphs) == 0 {
+		return 0
+	}
+	// 先按行带选中（支持折行），再只根据 X 定位，避免 Y 稍有偏差就落到第 0 列。
+	row := glyphs[0]
+	bestRow := rowDistY(local.Y, glyphs[0])
+	for _, g := range glyphs[1:] {
+		if d := rowDistY(local.Y, g); d < bestRow {
+			row, bestRow = g, d
+		}
+	}
+	best := row.at
 	for _, g := range glyphs {
-		x0 := g.x
-		x1 := g.x + g.adv
-		top := g.y - g.ascent
-		bot := g.y + g.descent
-		if local.Y < top || local.Y >= bot {
-			if local.Y >= bot {
-				best = g.after
-			}
+		if rowDistY(local.Y, g) != bestRow && g.y != row.y {
 			continue
 		}
-		if local.X < x0 {
+		if local.X < g.x {
 			return g.at
 		}
-		if local.X < x1 {
-			if local.X-x0 < x1-local.X {
+		if local.X < g.x+g.adv {
+			if local.X-g.x < g.x+g.adv-local.X {
 				return g.at
 			}
 			return g.after
@@ -263,6 +325,17 @@ func (u *UI) runeAt(gtx C, s string, local image.Point, maxW int) int {
 		best = g.after
 	}
 	return best
+}
+
+func rowDistY(y int, g logGlyph) int {
+	top, bot := g.y-g.ascent, g.y+g.descent
+	if y >= top && y < bot {
+		return 0
+	}
+	if y < top {
+		return top - y
+	}
+	return y - bot + 1
 }
 
 func (u *UI) selectionRects(gtx C, s string, startCol, endCol, maxW int) []image.Rectangle {

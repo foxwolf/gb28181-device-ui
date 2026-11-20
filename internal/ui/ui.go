@@ -16,8 +16,9 @@ import (
 	"gioui.org/app"
 	"gioui.org/font"
 	"gioui.org/font/gofont"
-	"gioui.org/gesture"
 	"gioui.org/io/clipboard"
+	"gioui.org/io/event"
+	"gioui.org/io/pointer"
 	"gioui.org/io/system"
 	"gioui.org/layout"
 	"gioui.org/op"
@@ -77,17 +78,25 @@ type UI struct {
 
 	startBtn, stopBtn, saveBtn, loadBtn, exitBtn, copyLogsBtn widget.Clickable
 
-	formList    layout.List
-	logList     layout.List
-	logClick    gesture.Click
-	logDrag     gesture.Drag
-	logStart    logPos
-	logEnd      logPos
-	logDragging bool
-	logFocused  bool
-	logHits     []lineHit
-	logWidth    int
-	logCopiedAt time.Time
+	formList      layout.List
+	logList       layout.List
+	logPtr        struct{}
+	logStart      logPos
+	logEnd        logPos
+	logDragging   bool
+	logFocused    bool
+	logHits       []lineHit
+	logWidth      int
+	logPressLocal image.Point
+	logCopiedAt   time.Time
+	hwnd          uintptr
+	winPtr        struct{}
+	winPress      image.Point
+	haveWinPress  bool
+	logOrigin     image.Point
+	haveLogOrigin bool
+	frameSize     image.Point
+	clientSize    image.Point
 
 	mu           sync.Mutex
 	localIP      string
@@ -173,11 +182,10 @@ func (u *UI) Run() error {
 	u.win = w
 	u.refreshLocalIP(true)
 
-	var hwnd uintptr
 	var placed bool
 	for {
 		ev := w.Event()
-		tryPlaceOnCursorMonitor(ev, &hwnd, &placed)
+		tryPlaceOnCursorMonitor(ev, &u.hwnd, &placed)
 		switch e := ev.(type) {
 		case *app.ClosingEvent:
 			u.shutdown()
@@ -185,6 +193,7 @@ func (u *UI) Run() error {
 			u.shutdown()
 			return e.Err
 		case app.FrameEvent:
+			u.frameSize = e.Size
 			gtx := app.NewContext(&u.ops, e)
 			u.frame(gtx)
 			e.Frame(gtx.Ops)
@@ -263,6 +272,11 @@ func (u *UI) readConfig() appconfig.Config {
 }
 
 func (u *UI) frame(gtx C) {
+	u.processWinPointer(gtx)
+	defer pointer.PassOp{}.Push(gtx.Ops).Pop()
+	defer clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops).Pop()
+	event.Op(gtx.Ops, &u.winPtr)
+
 	running := u.run.Running()
 	for _, ed := range u.editors() {
 		ed.ReadOnly = running

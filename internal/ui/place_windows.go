@@ -13,6 +13,8 @@ import (
 var (
 	user32              = windows.NewLazySystemDLL("user32.dll")
 	procGetCursorPos    = user32.NewProc("GetCursorPos")
+	procScreenToClient  = user32.NewProc("ScreenToClient")
+	procGetClientRect   = user32.NewProc("GetClientRect")
 	procMonitorFromRect = user32.NewProc("MonitorFromRect")
 	procGetMonitorInfoW = user32.NewProc("GetMonitorInfoW")
 	procGetWindowRect   = user32.NewProc("GetWindowRect")
