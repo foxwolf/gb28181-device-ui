@@ -28,6 +28,23 @@ func TestRedactsPassword(t *testing.T) {
 	}
 }
 
+func TestDumpRedactsPassword(t *testing.T) {
+	b := New(nil)
+	b.SetSecret("super-secret")
+	b.Append(slog.LevelInfo, "auth with super-secret failed")
+	b.Append(slog.LevelError, "无法打开摄像头：I/O error")
+	got := b.Dump()
+	if strings.Contains(got, "super-secret") {
+		t.Fatalf("password leaked in dump: %s", got)
+	}
+	if !strings.Contains(got, "无法打开摄像头") || !strings.Contains(got, "INFO") || !strings.Contains(got, "ERROR") {
+		t.Fatalf("dump missing lines: %s", got)
+	}
+	if strings.Count(got, "\n") != 1 {
+		t.Fatalf("expected two lines, got %q", got)
+	}
+}
+
 func TestSessionFromLogs(t *testing.T) {
 	var s Session
 	ApplySession(&s, "gb28181: sending initial REGISTER")

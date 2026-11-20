@@ -123,6 +123,22 @@ func (b *Buffer) Lines() []Line {
 	return out
 }
 
+// Dump 返回当前窗口中的全部日志文本（已脱敏），便于复制到剪贴板。
+func (b *Buffer) Dump() string {
+	lines := b.Lines()
+	if len(lines) == 0 {
+		return ""
+	}
+	var out strings.Builder
+	for i, line := range lines {
+		if i > 0 {
+			out.WriteByte('\n')
+		}
+		out.WriteString(line.Text)
+	}
+	return out.String()
+}
+
 func (b *Buffer) Enabled(_ context.Context, level slog.Level) bool {
 	return level >= b.level
 }

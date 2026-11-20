@@ -5,6 +5,7 @@ import (
 	"context"
 	"image"
 	"image/color"
+	"io"
 	"log/slog"
 	"os"
 	"strconv"
@@ -15,6 +16,8 @@ import (
 	"gioui.org/app"
 	"gioui.org/font"
 	"gioui.org/font/gofont"
+	"gioui.org/gesture"
+	"gioui.org/io/clipboard"
 	"gioui.org/io/system"
 	"gioui.org/layout"
 	"gioui.org/op"
@@ -63,9 +66,28 @@ type UI struct {
 	camPick                                        *videosrc.Device
 	selectedCam                                    videosrc.Device
 
-	startBtn, stopBtn, saveBtn, loadBtn, exitBtn widget.Clickable
+	preview         *previewHub
+	previewMu       sync.Mutex
+	previewSess     videosrc.Session
+	previewCancel   context.CancelFunc
+	previewKey      string
+	previewStarting bool
+	previewOp       paint.ImageOp
+	previewDrawn    int
 
-	logList layout.List
+	startBtn, stopBtn, saveBtn, loadBtn, exitBtn, copyLogsBtn widget.Clickable
+
+	formList    layout.List
+	logList     layout.List
+	logClick    gesture.Click
+	logDrag     gesture.Drag
+	logStart    logPos
+	logEnd      logPos
+	logDragging bool
+	logFocused  bool
+	logHits     []lineHit
+	logWidth    int
+	logCopiedAt time.Time
 
 	mu           sync.Mutex
 	localIP      string
@@ -82,6 +104,7 @@ type UI struct {
 func New() *UI {
 	u := &UI{
 		cfgPath:     appconfig.Path(),
+		formList:    layout.List{Axis: layout.Vertical},
 		logList:     layout.List{Axis: layout.Vertical},
 		stickBottom: true,
 	}
@@ -102,6 +125,7 @@ func New() *UI {
 	u.password.Mask = '●'
 	u.transport.Value = "udp"
 	u.backend.Value = videosrc.BackendSynthetic
+	u.initPreview()
 	return u
 }
 
@@ -143,8 +167,8 @@ func (u *UI) Run() error {
 	w := new(app.Window)
 	w.Option(
 		app.Title("GB28181 设备模拟器"),
-		app.Size(unit.Dp(1120), unit.Dp(860)),
-		app.MinSize(unit.Dp(880), unit.Dp(680)),
+		app.Size(unit.Dp(1000), unit.Dp(680)),
+		app.MinSize(unit.Dp(720), unit.Dp(500)),
 	)
 	u.win = w
 	u.refreshLocalIP(true)
@@ -169,6 +193,7 @@ func (u *UI) Run() error {
 }
 
 func (u *UI) shutdown() {
+	u.stopStandalonePreview(true)
 	if u.run.Running() {
 		u.run.Stop()
 		_ = appconfig.Save(u.cfgPath, u.readConfig())
@@ -271,22 +296,26 @@ func (u *UI) frame(gtx C) {
 	if u.loadBtn.Clicked(gtx) && !running {
 		u.onLoad()
 	}
+	if u.copyLogsBtn.Clicked(gtx) {
+		u.copyLogsToClipboard(gtx)
+	}
 	if u.exitBtn.Clicked(gtx) {
 		u.shutdown()
 		u.win.Perform(system.ActionClose)
 	}
 
 	u.handleCameraInput(gtx, running)
+	u.syncPreview(running)
 
 	paint.Fill(gtx.Ops, rgb(0xF4F6F8))
 	layout.UniformInset(unit.Dp(14)).Layout(gtx, func(gtx C) D {
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 			layout.Rigid(u.header),
 			layout.Rigid(gap(10)),
-			layout.Rigid(func(gtx C) D {
+			layout.Flexed(1.35, func(gtx C) D {
 				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Start}.Layout(gtx,
 					layout.Flexed(1.15, func(gtx C) D {
-						return card(gtx, u.th, u.form)
+						return card(gtx, u.th, u.scrollForm)
 					}),
 					layout.Rigid(func(gtx C) D { return layout.Spacer{Width: unit.Dp(12)}.Layout(gtx) }),
 					layout.Flexed(0.85, func(gtx C) D {
@@ -311,11 +340,17 @@ func (u *UI) header(gtx C) D {
 		}),
 		layout.Rigid(gap(4)),
 		layout.Rigid(func(gtx C) D {
-			l := material.Label(u.th, unit.Sp(13), "基于 gb28181-go 设备侧（UAC）库。可选择本机摄像头（FFmpeg）或合成占位画面。")
+			l := material.Label(u.th, unit.Sp(13), "基于 gb28181-go 设备侧（UAC）库。选中摄像头后即可在右侧预览画面，启动后预览会继续显示。")
 			l.Color = rgb(0x9A5B00)
 			return l.Layout(gtx)
 		}),
 	)
+}
+
+func (u *UI) scrollForm(gtx C) D {
+	return u.formList.Layout(gtx, 1, func(gtx C, _ int) D {
+		return u.form(gtx)
+	})
 }
 
 func (u *UI) form(gtx C) D {
@@ -596,10 +631,13 @@ func (u *UI) videoHint() (string, bool) {
 	if n == 0 {
 		return "未扫描到摄像头。请确认已安装摄像头驱动，并点击「刷新」。", true
 	}
-	return "将通过 FFmpeg 采集选中的本机摄像头。", false
+	return "选中摄像头后即可预览；启动后预览会继续显示，并由同一路采集推流。", false
 }
 
 func (u *UI) handleCameraInput(gtx C, running bool) {
+	prevCam := u.selectedCam
+	prevBackend := u.lastBackend
+
 	u.mu.Lock()
 	if u.camPick != nil {
 		u.selectedCam = *u.camPick
@@ -608,10 +646,14 @@ func (u *UI) handleCameraInput(gtx C, running bool) {
 	u.mu.Unlock()
 
 	if u.refreshCamBtn.Clicked(gtx) && !running && u.backend.Value == videosrc.BackendFFmpeg {
+		u.restartPreview()
 		u.refreshCameras()
 	}
 	if u.backend.Value == videosrc.BackendFFmpeg && u.lastBackend != videosrc.BackendFFmpeg {
 		u.refreshCameras()
+	}
+	if !running && prevBackend != "" && u.backend.Value != prevBackend {
+		u.restartPreview()
 	}
 	u.lastBackend = u.backend.Value
 	if u.backend.Value != videosrc.BackendFFmpeg || running {
@@ -634,6 +676,17 @@ func (u *UI) handleCameraInput(gtx C, running bool) {
 			}
 		}
 	}
+	if !running && videosrcDeviceKey(prevCam) != videosrcDeviceKey(u.selectedCam) {
+		u.restartPreview()
+	}
+}
+
+func videosrcDeviceKey(d videosrc.Device) string {
+	id := strings.TrimSpace(d.ID)
+	if id == "" {
+		id = strings.TrimSpace(d.Name)
+	}
+	return id
 }
 
 func (u *UI) refreshCameras() {
@@ -769,6 +822,8 @@ func (u *UI) statusPane(gtx C) D {
 	}
 
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(u.previewPane),
+		layout.Rigid(gap(12)),
 		layout.Rigid(func(gtx C) D {
 			l := material.Label(u.th, unit.Sp(15), "状态")
 			l.Font.Weight = font.SemiBold
@@ -839,12 +894,21 @@ func (u *UI) kv(k, v string, vc color.NRGBA) layout.Widget {
 }
 
 func (u *UI) logPane(gtx C) D {
-	lines := u.logs.Lines()
+	copyLabel := "复制日志"
+	if !u.logCopiedAt.IsZero() && time.Since(u.logCopiedAt) < 2*time.Second {
+		copyLabel = "已复制"
+		gtx.Execute(op.InvalidateCmd{At: u.logCopiedAt.Add(2 * time.Second)})
+	}
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(func(gtx C) D {
-			l := material.Label(u.th, unit.Sp(15), "日志")
-			l.Font.Weight = font.SemiBold
-			return l.Layout(gtx)
+			return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+				layout.Flexed(1, func(gtx C) D {
+					l := material.Label(u.th, unit.Sp(15), "日志（可划选后 Ctrl+C）")
+					l.Font.Weight = font.SemiBold
+					return l.Layout(gtx)
+				}),
+				layout.Rigid(u.btn(&u.copyLogsBtn, copyLabel, rgb(0x455A64), true)),
+			)
 		}),
 		layout.Rigid(gap(6)),
 		layout.Flexed(1, func(gtx C) D {
@@ -855,30 +919,33 @@ func (u *UI) logPane(gtx C) D {
 			}.Layout(gtx, func(gtx C) D {
 				defer clip.UniformRRect(image.Rectangle{Max: gtx.Constraints.Max}, gtx.Dp(4)).Push(gtx.Ops).Pop()
 				paint.Fill(gtx.Ops, rgb(0xFAFBFC))
-				return layout.UniformInset(unit.Dp(8)).Layout(gtx, func(gtx C) D {
-					if u.stickBottom {
-						u.logList.Position.BeforeEnd = false
-					}
-					dims := u.logList.Layout(gtx, len(lines), func(gtx C, i int) D {
-						l := material.Label(u.th, unit.Sp(12), lines[i].Text)
-						l.Color = levelColor(lines[i].Level)
-						l.MaxLines = 0
-						return layout.Inset{Bottom: unit.Dp(2)}.Layout(gtx, l.Layout)
-					})
-					u.stickBottom = !u.logList.Position.BeforeEnd
-					return dims
-				})
+				return layout.UniformInset(unit.Dp(8)).Layout(gtx, u.layoutLogText)
 			})
 		}),
 	)
+}
+
+func (u *UI) copyLogsToClipboard(gtx C) {
+	text := u.selectedLogText()
+	if text == "" {
+		text = u.logs.Dump()
+	}
+	gtx.Execute(clipboard.WriteCmd{Type: "application/text", Data: io.NopCloser(strings.NewReader(text))})
+	u.logCopiedAt = time.Now()
+	if u.win != nil {
+		u.win.Invalidate()
+	}
 }
 
 func (u *UI) onStart() {
 	cfg := u.readConfig()
 	u.logs.SetSecret(cfg.Password)
 	u.refreshLocalIP(true)
-	if err := u.run.Start(cfg); err != nil {
+	// 同一摄像头不能被打开两次：先停独立预览，再启动带预览的双输出采集。
+	u.stopStandalonePreview(false)
+	if err := u.run.Start(cfg, u.preview); err != nil {
 		u.logs.Append(slog.LevelError, err.Error())
+		u.syncPreview(false)
 		return
 	}
 	_ = appconfig.Save(u.cfgPath, cfg)
@@ -889,6 +956,7 @@ func (u *UI) onStop() {
 	if err := appconfig.Save(u.cfgPath, u.readConfig()); err != nil {
 		u.logs.Append(slog.LevelWarn, "自动保存配置失败："+err.Error())
 	}
+	u.syncPreview(false)
 }
 
 func (u *UI) onSave() {
