@@ -79,6 +79,7 @@ type UI struct {
 	startBtn, stopBtn, saveBtn, loadBtn, exitBtn, copyLogsBtn widget.Clickable
 
 	formList      layout.List
+	statusList    layout.List
 	logList       layout.List
 	logPtr        struct{}
 	logStart      logPos
@@ -114,6 +115,7 @@ func New() *UI {
 	u := &UI{
 		cfgPath:     appconfig.Path(),
 		formList:    layout.List{Axis: layout.Vertical},
+		statusList:  layout.List{Axis: layout.Vertical},
 		logList:     layout.List{Axis: layout.Vertical},
 		stickBottom: true,
 	}
@@ -329,7 +331,7 @@ func (u *UI) frame(gtx C) {
 			layout.Flexed(1.35, func(gtx C) D {
 				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Start}.Layout(gtx,
 					layout.Flexed(1.15, func(gtx C) D {
-						return card(gtx, u.th, u.scrollForm)
+						return card(gtx, u.th, u.formPane)
 					}),
 					layout.Rigid(func(gtx C) D { return layout.Spacer{Width: unit.Dp(12)}.Layout(gtx) }),
 					layout.Flexed(0.85, func(gtx C) D {
@@ -361,14 +363,46 @@ func (u *UI) header(gtx C) D {
 	)
 }
 
+func (u *UI) formPane(gtx C) D {
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Flexed(1, u.scrollForm),
+		layout.Rigid(gap(8)),
+		layout.Rigid(hairline),
+		layout.Rigid(gap(10)),
+		layout.Rigid(u.actionBar),
+	)
+}
+
 func (u *UI) scrollForm(gtx C) D {
 	return u.formList.Layout(gtx, 1, func(gtx C, _ int) D {
 		return u.form(gtx)
 	})
 }
 
-func (u *UI) form(gtx C) D {
+func (u *UI) actionBar(gtx C) D {
 	running := u.run.Running()
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(func(gtx C) D {
+			return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+				layout.Flexed(1, u.primaryBtn(&u.startBtn, "启动", rgb(0x157A3A), !running)),
+				layout.Rigid(func(gtx C) D { return layout.Spacer{Width: unit.Dp(8)}.Layout(gtx) }),
+				layout.Flexed(1, u.primaryBtn(&u.stopBtn, "停止", rgb(0xC0392B), running)),
+			)
+		}),
+		layout.Rigid(gap(8)),
+		layout.Rigid(func(gtx C) D {
+			return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+				layout.Rigid(u.btn(&u.saveBtn, "保存配置", rgb(0x1565C0), true)),
+				layout.Rigid(func(gtx C) D { return layout.Spacer{Width: unit.Dp(8)}.Layout(gtx) }),
+				layout.Rigid(u.btn(&u.loadBtn, "加载配置", rgb(0x455A64), !running)),
+				layout.Rigid(func(gtx C) D { return layout.Spacer{Width: unit.Dp(8)}.Layout(gtx) }),
+				layout.Rigid(u.btn(&u.exitBtn, "退出", rgb(0x607080), true)),
+			)
+		}),
+	)
+}
+
+func (u *UI) form(gtx C) D {
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(func(gtx C) D {
 			l := material.Label(u.th, unit.Sp(15), "连接参数")
@@ -398,20 +432,6 @@ func (u *UI) form(gtx C) D {
 		layout.Rigid(u.sourceRow),
 		layout.Rigid(u.cameraRow),
 		layout.Rigid(u.ffmpegHint),
-		layout.Rigid(gap(12)),
-		layout.Rigid(func(gtx C) D {
-			return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
-				layout.Rigid(u.btn(&u.startBtn, "启动", rgb(0x157A3A), !running)),
-				layout.Rigid(func(gtx C) D { return layout.Spacer{Width: unit.Dp(8)}.Layout(gtx) }),
-				layout.Rigid(u.btn(&u.stopBtn, "停止", rgb(0xC0392B), running)),
-				layout.Rigid(func(gtx C) D { return layout.Spacer{Width: unit.Dp(8)}.Layout(gtx) }),
-				layout.Rigid(u.btn(&u.saveBtn, "保存配置", rgb(0x1565C0), true)),
-				layout.Rigid(func(gtx C) D { return layout.Spacer{Width: unit.Dp(8)}.Layout(gtx) }),
-				layout.Rigid(u.btn(&u.loadBtn, "加载配置", rgb(0x455A64), !running)),
-				layout.Rigid(func(gtx C) D { return layout.Spacer{Width: unit.Dp(8)}.Layout(gtx) }),
-				layout.Rigid(u.btn(&u.exitBtn, "退出", rgb(0x607080), true)),
-			)
-		}),
 	)
 }
 
@@ -795,11 +815,22 @@ func (u *UI) miniRow(label string, ed *widget.Editor) layout.Widget {
 }
 
 func (u *UI) btn(clk *widget.Clickable, label string, bg color.NRGBA, enabled bool) layout.Widget {
+	return u.styledBtn(clk, label, bg, enabled, unit.Sp(13), layout.Inset{Top: unit.Dp(7), Bottom: unit.Dp(7), Left: unit.Dp(14), Right: unit.Dp(14)}, false)
+}
+
+func (u *UI) primaryBtn(clk *widget.Clickable, label string, bg color.NRGBA, enabled bool) layout.Widget {
+	return u.styledBtn(clk, label, bg, enabled, unit.Sp(15), layout.Inset{Top: unit.Dp(9), Bottom: unit.Dp(9), Left: unit.Dp(16), Right: unit.Dp(16)}, true)
+}
+
+func (u *UI) styledBtn(clk *widget.Clickable, label string, bg color.NRGBA, enabled bool, size unit.Sp, inset layout.Inset, fill bool) layout.Widget {
 	return func(gtx C) D {
+		if fill {
+			gtx.Constraints.Min.X = gtx.Constraints.Max.X
+		}
 		style := material.Button(u.th, clk, label)
-		style.TextSize = unit.Sp(13)
+		style.TextSize = size
 		style.CornerRadius = unit.Dp(4)
-		style.Inset = layout.Inset{Top: unit.Dp(7), Bottom: unit.Dp(7), Left: unit.Dp(14), Right: unit.Dp(14)}
+		style.Inset = inset
 		if !enabled {
 			style.Background = rgb(0xC5CBD3)
 			style.Color = rgb(0xF7F8FA)
@@ -838,6 +869,16 @@ func (u *UI) statusPane(gtx C) D {
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(u.previewPane),
 		layout.Rigid(gap(12)),
+		layout.Flexed(1, func(gtx C) D {
+			return u.statusList.Layout(gtx, 1, func(gtx C, _ int) D {
+				return u.statusBody(gtx, st, errText, sess, ipText, ipErr, stateColor)
+			})
+		}),
+	)
+}
+
+func (u *UI) statusBody(gtx C, st runner.State, errText string, sess logview.Session, ipText, ipErr string, stateColor color.NRGBA) D {
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(func(gtx C) D {
 			l := material.Label(u.th, unit.Sp(15), "状态")
 			l.Font.Weight = font.SemiBold
@@ -1110,6 +1151,17 @@ func card(gtx C, _ *material.Theme, w layout.Widget) D {
 
 func gap(n unit.Dp) layout.Widget {
 	return func(gtx C) D { return layout.Spacer{Height: n}.Layout(gtx) }
+}
+
+func hairline(gtx C) D {
+	h := gtx.Dp(unit.Dp(1))
+	w := gtx.Constraints.Max.X
+	if w < 1 {
+		w = gtx.Constraints.Min.X
+	}
+	defer clip.Rect{Max: image.Pt(w, h)}.Push(gtx.Ops).Pop()
+	paint.Fill(gtx.Ops, rgb(0xE4E7EB))
+	return D{Size: image.Pt(w, h)}
 }
 
 func dash(s string) string {
