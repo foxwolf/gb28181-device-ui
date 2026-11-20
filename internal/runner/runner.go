@@ -82,7 +82,8 @@ func (r *Runner) Server() *device.Server {
 
 // Start 根据界面配置启动设备。密码为空或已在运行时立即返回错误。
 // 端口占用等绑定错误会在 Start 返回之后通过状态变为「出错」体现。
-func (r *Runner) Start(cfg appconfig.Config) error {
+// preview 可为 nil。非空时采集后端会同时输出本地预览帧；预览失败不应伪装成已经在向平台推流。
+func (r *Runner) Start(cfg appconfig.Config, preview videosrc.PreviewSink) error {
 	if strings.TrimSpace(cfg.Password) == "" {
 		return ErrEmptyPassword
 	}
@@ -117,7 +118,7 @@ func (r *Runner) Start(cfg appconfig.Config) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	hub := device.NewFrameHub()
-	sess, err := backend.Open(ctx, dev, videosrc.Options{FPS: 25}, hub)
+	sess, err := backend.Open(ctx, dev, videosrc.Options{FPS: 25, Preview: preview}, hub)
 	if err != nil {
 		cancel()
 		return err

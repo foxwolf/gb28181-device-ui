@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -66,6 +67,18 @@ func (f *FFmpeg) Open(ctx context.Context, dev Device, opts Options, dest Sink) 
 	if dest == nil {
 		return nil, errNilSink
 	}
+	return f.start(ctx, dev, opts, dest, false)
+}
+
+// Preview 只打开摄像头并输出 RGBA 预览，不编码 H.264，也不启动 SIP。
+func (f *FFmpeg) Preview(ctx context.Context, dev Device, dest PreviewSink) (Session, error) {
+	if dest == nil {
+		return nil, errNilPreview
+	}
+	return f.start(ctx, dev, Options{Preview: dest}, nil, true)
+}
+
+func (f *FFmpeg) start(ctx context.Context, dev Device, opts Options, dest Sink, previewOnly bool) (Session, error) {
 	if runtime.GOOS != "windows" {
 		return nil, errFFmpegNotWin
 	}
@@ -80,35 +93,63 @@ func (f *FFmpeg) Open(ctx context.Context, dev Device, opts Options, dest Sink) 
 	if id == "" {
 		return nil, errNoCamera
 	}
-	encArgs, err := f.encoderArgs(ctx, bin)
-	if err != nil {
-		return nil, err
+
+	var encArgs []string
+	if !previewOnly {
+		encArgs, err = f.encoderArgs(ctx, bin)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var ln net.Listener
+	var previewPort int
+	if opts.Preview != nil {
+		ln, previewPort, err = listenPreview()
+		if err != nil {
+			if previewOnly {
+				return nil, err
+			}
+			// 推流时预览失败不阻断 SIP / H.264，把错误交给界面显示。
+			reportPreviewError(opts.Preview, err)
+			ln = nil
+			previewPort = 0
+		}
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
-	args := captureArgs(id, opts, encArgs)
+	args := captureArgs(id, opts, encArgs, previewPort)
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.SysProcAttr = cmdSysProcAttr()
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("无法读取 ffmpeg 输出：%w", err)
+	var stdout io.ReadCloser
+	if !previewOnly {
+		stdout, err = cmd.StdoutPipe()
+		if err != nil {
+			cancel()
+			closeListener(ln)
+			return nil, fmt.Errorf("无法读取 ffmpeg 输出：%w", err)
+		}
+	} else {
+		cmd.Stdout = io.Discard
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		cancel()
+		closeListener(ln)
 		return nil, fmt.Errorf("无法读取 ffmpeg 日志：%w", err)
 	}
 	if err := cmd.Start(); err != nil {
 		cancel()
+		closeListener(ln)
 		return nil, fmt.Errorf("无法启动 ffmpeg：%w", err)
 	}
 
 	s := &ffmpegSession{
-		cancel: cancel,
-		cmd:    cmd,
-		done:   make(chan error, 1),
+		cancel:   cancel,
+		cmd:      cmd,
+		listener: ln,
+		done:     make(chan error, 1),
 	}
 
 	var stderrMu sync.Mutex
@@ -119,11 +160,23 @@ func (f *FFmpeg) Open(ctx context.Context, dev Device, opts Options, dest Sink) 
 	var startOnce sync.Once
 	signalStart := func() { startOnce.Do(func() { close(started) }) }
 
+	if ln != nil && opts.Preview != nil {
+		go servePreview(ctx, ln, opts.Preview, func() {
+			if previewOnly {
+				signalStart()
+			}
+		})
+	}
+
 	go func() {
-		err := readAnnexB(ctx, stdout, dest, signalStart)
-		_ = stdout.Close()
-		killCmd(cmd)
+		var err error
+		if !previewOnly && stdout != nil {
+			err = readAnnexB(ctx, stdout, dest, signalStart)
+			_ = stdout.Close()
+			killCmd(cmd)
+		}
 		waitErr := cmd.Wait()
+		closeListener(ln)
 		if ctx.Err() != nil {
 			s.finish(nil)
 			return
@@ -143,13 +196,21 @@ func (f *FFmpeg) Open(ctx context.Context, dev Device, opts Options, dest Sink) 
 	fail := func(err error) (Session, error) {
 		cancel()
 		killCmd(cmd)
+		closeListener(ln)
 		if err == nil {
 			err = errors.New("ffmpeg 在输出码流前已退出")
+		}
+		if previewOnly {
+			return nil, fmt.Errorf("启动摄像头预览失败：%w", err)
 		}
 		return nil, fmt.Errorf("启动摄像头采集失败：%w", err)
 	}
 
-	slog.Info("界面：已启动 FFmpeg 采集进程", "encoder", f.encName, "camera", strings.TrimSpace(dev.Name))
+	if previewOnly {
+		slog.Info("界面：已启动 FFmpeg 预览进程", "camera", strings.TrimSpace(dev.Name))
+	} else {
+		slog.Info("界面：已启动 FFmpeg 采集进程", "encoder", f.encName, "camera", strings.TrimSpace(dev.Name), "preview", previewPort > 0)
+	}
 
 	timer := time.NewTimer(4 * time.Second)
 	defer timer.Stop()
@@ -167,10 +228,14 @@ func (f *FFmpeg) Open(ctx context.Context, dev Device, opts Options, dest Sink) 
 	case <-ctx.Done():
 		cancel()
 		killCmd(cmd)
+		closeListener(ln)
 		<-s.done
+		if previewOnly {
+			return nil, fmt.Errorf("启动摄像头预览已取消")
+		}
 		return nil, fmt.Errorf("启动摄像头采集已取消")
 	case <-timer.C:
-		// 进程仍在运行但尚未出帧：部分摄像头初始化较慢，先交给界面继续启动。
+		// 进程仍在运行但尚未出帧：部分摄像头初始化较慢，先交给界面继续。
 		select {
 		case err := <-s.done:
 			return fail(err)
@@ -180,23 +245,59 @@ func (f *FFmpeg) Open(ctx context.Context, dev Device, opts Options, dest Sink) 
 	}
 }
 
-func captureArgs(deviceID string, opts Options, encArgs []string) []string {
+// captureArgs 拼装 ffmpeg 参数。
+// previewPort>0 且 encArgs 为空：只出预览 RGBA；
+// previewPort>0 且 encArgs 非空：stdout 出 Annex-B H.264，同时把 RGBA 推到本机 TCP；
+// previewPort==0：仅编码（与原先行为一致）。
+func captureArgs(deviceID string, opts Options, encArgs []string, previewPort int) []string {
 	args := []string{
 		"-hide_banner", "-nostdin", "-loglevel", "error",
 		"-f", "dshow", "-rtbufsize", "100M",
 		"-i", dshowVideoInput(deviceID),
-		"-an",
-		"-pix_fmt", "yuv420p",
 	}
+	var previewDest string
+	if previewPort > 0 {
+		previewDest = previewURL(previewPort)
+	}
+
+	if previewDest != "" && len(encArgs) == 0 {
+		args = append(args, "-an", "-vf", PreviewFilter, "-f", "rawvideo", previewDest)
+		return args
+	}
+
+	if previewDest != "" {
+		fc := "[0:v]split=2[enc][prev];[prev]" + PreviewFilter + "[rgba]"
+		args = append(args, "-filter_complex", fc)
+		args = append(args, "-map", "[enc]", "-an", "-pix_fmt", "yuv420p")
+		args = append(args, sizeRateArgs(opts)...)
+		args = append(args, encArgs...)
+		args = append(args, "-bsf:v", "h264_mp4toannexb", "-f", "h264", "pipe:1")
+		args = append(args, "-map", "[rgba]", "-an", "-f", "rawvideo", previewDest)
+		return args
+	}
+
+	args = append(args, "-an", "-pix_fmt", "yuv420p")
+	args = append(args, sizeRateArgs(opts)...)
+	args = append(args, encArgs...)
+	args = append(args, "-bsf:v", "h264_mp4toannexb", "-f", "h264", "pipe:1")
+	return args
+}
+
+func sizeRateArgs(opts Options) []string {
+	var args []string
 	if opts.Width > 0 && opts.Height > 0 {
 		args = append(args, "-s", fmt.Sprintf("%dx%d", opts.Width, opts.Height))
 	}
 	if opts.FPS > 0 {
 		args = append(args, "-r", fmt.Sprintf("%d", opts.FPS))
 	}
-	args = append(args, encArgs...)
-	args = append(args, "-bsf:v", "h264_mp4toannexb", "-f", "h264", "pipe:1")
 	return args
+}
+
+func closeListener(ln net.Listener) {
+	if ln != nil {
+		_ = ln.Close()
+	}
 }
 
 func (f *FFmpeg) encoderArgs(_ context.Context, bin string) ([]string, error) {
@@ -326,11 +427,12 @@ func firstLine(s string) string {
 }
 
 type ffmpegSession struct {
-	cancel context.CancelFunc
-	cmd    *exec.Cmd
-	done   chan error
-	closed atomic.Bool
-	once   atomic.Bool
+	cancel   context.CancelFunc
+	cmd      *exec.Cmd
+	listener net.Listener
+	done     chan error
+	closed   atomic.Bool
+	once     atomic.Bool
 }
 
 func (s *ffmpegSession) Close() error {
@@ -340,6 +442,7 @@ func (s *ffmpegSession) Close() error {
 	if s.cancel != nil {
 		s.cancel()
 	}
+	closeListener(s.listener)
 	killCmd(s.cmd)
 	return nil
 }

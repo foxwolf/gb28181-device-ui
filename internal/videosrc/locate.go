@@ -11,6 +11,7 @@ import (
 var (
 	errFFmpegNotFound = errors.New("未找到 ffmpeg。请将 ffmpeg.exe 放到本程序同一目录，或加入系统 PATH")
 	errNilSink        = errors.New("视频输出（Sink）不能为空")
+	errNilPreview     = errors.New("预览输出不能为空")
 	errNoCamera       = errors.New("请先选择一个摄像头，或点击「刷新」扫描本机设备")
 	errFFmpegNotWin   = errors.New("本机摄像头采集目前仅支持 Windows（DirectShow）")
 	errNoH264Encoder  = errors.New("当前 ffmpeg 未包含 libx264 或 h264_mf 编码器，请更换带 H.264 编码的 Windows 构建")

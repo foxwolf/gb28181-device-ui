@@ -38,8 +38,10 @@ type Device struct {
 
 // Options 是采集/编码参数。0 表示使用编码器或设备默认值。
 // 优先 25fps、yuv420p、baseline、无 B 帧、较密的 IDR。
+// Preview 非空时，在编码的同时输出固定尺寸的 RGBA 预览帧（FFmpeg 走第二路，不在本进程解码）。
 type Options struct {
 	Width, Height, FPS int
+	Preview            PreviewSink
 }
 
 // Sink 接收编码后的访问单元。语义与 FrameHub.Write 相同：
