@@ -178,8 +178,8 @@ func (u *UI) Run() error {
 	w := new(app.Window)
 	w.Option(
 		app.Title("GB28181 设备模拟器"),
-		app.Size(unit.Dp(1000), unit.Dp(680)),
-		app.MinSize(unit.Dp(720), unit.Dp(500)),
+		app.Size(unit.Dp(1000), unit.Dp(780)),
+		app.MinSize(unit.Dp(720), unit.Dp(560)),
 	)
 	u.win = w
 	u.refreshLocalIP(true)
@@ -328,7 +328,7 @@ func (u *UI) frame(gtx C) {
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 			layout.Rigid(u.header),
 			layout.Rigid(gap(10)),
-			layout.Flexed(1.35, func(gtx C) D {
+			layout.Flexed(1, func(gtx C) D {
 				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Start}.Layout(gtx,
 					layout.Flexed(1.15, func(gtx C) D {
 						return card(gtx, u.th, u.formPane)
@@ -340,7 +340,10 @@ func (u *UI) frame(gtx C) {
 				)
 			}),
 			layout.Rigid(gap(10)),
-			layout.Flexed(1, func(gtx C) D {
+			layout.Rigid(func(gtx C) D {
+				h := logPaneHeight(gtx)
+				gtx.Constraints.Min.Y = h
+				gtx.Constraints.Max.Y = h
 				return card(gtx, u.th, u.logPane)
 			}),
 		)
@@ -1147,6 +1150,26 @@ func card(gtx C, _ *material.Theme, w layout.Widget) D {
 		call.Add(gtx.Ops)
 		return dims
 	})
+}
+
+func logPaneHeight(gtx C) int {
+	avail := gtx.Constraints.Max.Y
+	minH := gtx.Dp(unit.Dp(120))
+	maxH := gtx.Dp(unit.Dp(168))
+	h := avail * 24 / 100
+	if h < minH {
+		h = minH
+	}
+	if h > maxH {
+		h = maxH
+	}
+	if avail > 0 && h > avail/2 {
+		h = avail / 2
+	}
+	if h < 1 {
+		h = minH
+	}
+	return h
 }
 
 func gap(n unit.Dp) layout.Widget {
