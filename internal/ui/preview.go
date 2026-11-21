@@ -11,6 +11,9 @@ import (
 
 	"gioui.org/f32"
 	"gioui.org/font"
+	"gioui.org/io/event"
+	"gioui.org/io/key"
+	"gioui.org/io/pointer"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/clip"
@@ -285,6 +288,8 @@ func (u *UI) previewPane(gtx C) D {
 	)
 }
 
+const previewDoubleClick = 500 * time.Millisecond
+
 func (u *UI) previewBox(gtx C) D {
 	w := gtx.Constraints.Max.X
 	if w < 1 {
@@ -304,7 +309,75 @@ func (u *UI) previewBox(gtx C) D {
 	gtx.Constraints.Min = size
 	gtx.Constraints.Max = size
 
+	u.processPreviewPointer(gtx)
 	defer clip.UniformRRect(image.Rectangle{Max: size}, gtx.Dp(4)).Push(gtx.Ops).Pop()
+	pointer.CursorPointer.Add(gtx.Ops)
+	event.Op(gtx.Ops, &u.previewPtr)
+	u.drawPreviewContent(gtx, size, true)
+	return D{Size: size}
+}
+
+func (u *UI) layoutExpandedPreview(gtx C) D {
+	u.processPreviewExpandKeys(gtx)
+	u.processPreviewPointer(gtx)
+
+	size := gtx.Constraints.Max
+	if size.X < 1 {
+		size.X = 1
+	}
+	if size.Y < 1 {
+		size.Y = 1
+	}
+	defer clip.Rect{Max: size}.Push(gtx.Ops).Pop()
+	paint.Fill(gtx.Ops, color.NRGBA{R: 0, G: 0, B: 0, A: 0xFF})
+	pointer.CursorPointer.Add(gtx.Ops)
+	event.Op(gtx.Ops, &u.previewPtr)
+	gtx.Execute(key.FocusCmd{Tag: &u.previewPtr})
+
+	fit := previewLetterbox(size)
+	ox := (size.X - fit.X) / 2
+	oy := (size.Y - fit.Y) / 2
+	func() {
+		defer op.Offset(image.Pt(ox, oy)).Push(gtx.Ops).Pop()
+		cgtx := gtx
+		cgtx.Constraints.Min = fit
+		cgtx.Constraints.Max = fit
+		u.drawPreviewContent(cgtx, fit, false)
+	}()
+
+	layout.S.Layout(gtx, func(gtx C) D {
+		l := material.Label(u.th, unit.Sp(12), "双击画面或按 Esc 退出放大")
+		l.Color = color.NRGBA{R: 0xC5, G: 0xCB, B: 0xD3, A: 0xC0}
+		l.Alignment = text.Middle
+		return layout.Inset{Bottom: unit.Dp(14)}.Layout(gtx, l.Layout)
+	})
+	return D{Size: size}
+}
+
+func previewLetterbox(box image.Point) image.Point {
+	if box.X < 1 || box.Y < 1 {
+		return image.Pt(1, 1)
+	}
+	w, h := box.X, box.X*videosrc.PreviewHeight/videosrc.PreviewWidth
+	if h > box.Y {
+		h = box.Y
+		w = h * videosrc.PreviewWidth / videosrc.PreviewHeight
+	}
+	if w < 1 {
+		w = 1
+	}
+	if h < 1 {
+		h = 1
+	}
+	return image.Pt(w, h)
+}
+
+func (u *UI) drawPreviewContent(gtx C, size image.Point, rounded bool) {
+	if rounded {
+		defer clip.UniformRRect(image.Rectangle{Max: size}, gtx.Dp(4)).Push(gtx.Ops).Pop()
+	} else {
+		defer clip.Rect{Max: size}.Push(gtx.Ops).Pop()
+	}
 	paint.Fill(gtx.Ops, color.NRGBA{R: 0, G: 0, B: 0, A: 0xFF})
 
 	img, gen, errText, status := u.preview.snapshot()
@@ -334,7 +407,80 @@ func (u *UI) previewBox(gtx C) D {
 			return layout.Inset{Left: unit.Dp(12), Right: unit.Dp(12)}.Layout(gtx, l.Layout)
 		})
 	}
-	return D{Size: size}
+}
+
+func (u *UI) processPreviewExpandKeys(gtx C) {
+	for {
+		ev, ok := gtx.Event(
+			key.FocusFilter{Target: &u.previewPtr},
+			key.Filter{Focus: &u.previewPtr, Name: key.NameEscape},
+			key.Filter{Name: key.NameEscape},
+		)
+		if !ok {
+			break
+		}
+		e, ok := ev.(key.Event)
+		if !ok {
+			continue
+		}
+		if e.State == key.Press && e.Modifiers == 0 {
+			u.previewExpanded = false
+			u.previewClickAt = time.Time{}
+			u.previewPressed = false
+		}
+	}
+}
+
+func (u *UI) processPreviewPointer(gtx C) {
+	for {
+		ev, ok := gtx.Event(pointer.Filter{
+			Target: &u.previewPtr,
+			Kinds:  pointer.Press | pointer.Release | pointer.Cancel,
+		})
+		if !ok {
+			break
+		}
+		e, ok := ev.(pointer.Event)
+		if !ok {
+			continue
+		}
+		switch e.Kind {
+		case pointer.Press:
+			if e.Source == pointer.Mouse && e.Buttons != pointer.ButtonPrimary {
+				continue
+			}
+			u.previewPressed = true
+			u.previewPressPt = e.Position.Round()
+		case pointer.Release:
+			if !u.previewPressed {
+				continue
+			}
+			u.previewPressed = false
+			pt := e.Position.Round()
+			if absInt(pt.X-u.previewPressPt.X) > 8 || absInt(pt.Y-u.previewPressPt.Y) > 8 {
+				u.previewClickAt = time.Time{}
+				continue
+			}
+			if !u.previewClickAt.IsZero() && gtx.Now.Sub(u.previewClickAt) <= previewDoubleClick &&
+				absInt(pt.X-u.previewClickPt.X) <= 16 && absInt(pt.Y-u.previewClickPt.Y) <= 16 {
+				u.previewExpanded = !u.previewExpanded
+				u.previewClickAt = time.Time{}
+			} else {
+				u.previewClickAt = gtx.Now
+				u.previewClickPt = pt
+			}
+		case pointer.Cancel:
+			u.previewPressed = false
+			u.previewClickAt = time.Time{}
+		}
+	}
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 func drawPreviewFitted(gtx C, imgOp paint.ImageOp, box image.Point) {

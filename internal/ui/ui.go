@@ -75,6 +75,12 @@ type UI struct {
 	previewStarting bool
 	previewOp       paint.ImageOp
 	previewDrawn    int
+	previewExpanded bool
+	previewPtr      struct{}
+	previewPressed  bool
+	previewPressPt  image.Point
+	previewClickAt  time.Time
+	previewClickPt  image.Point
 
 	startBtn, stopBtn, saveBtn, loadBtn, exitBtn, copyLogsBtn widget.Clickable
 
@@ -322,6 +328,11 @@ func (u *UI) frame(gtx C) {
 
 	u.handleCameraInput(gtx, running)
 	u.syncPreview(running)
+
+	if u.previewExpanded {
+		u.layoutExpandedPreview(gtx)
+		return
+	}
 
 	paint.Fill(gtx.Ops, rgb(0xF4F6F8))
 	layout.UniformInset(unit.Dp(14)).Layout(gtx, func(gtx C) D {
