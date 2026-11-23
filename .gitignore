@@ -22,3 +22,6 @@ go.work.sum
 *~
 .DS_Store
 Thumbs.db
+
+# 本地排查产出（可能含录像、exe 备份、密钥，切勿提交）
+diagnostics/
