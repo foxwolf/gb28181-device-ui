@@ -94,7 +94,7 @@ func TestEarlyCatalogDuringRegisterWait(t *testing.T) {
 		if strings.HasPrefix(s, "SIP/2.0 200") && strings.Contains(s, "CSeq: 1 MESSAGE") {
 			saw200 = true
 		}
-		if strings.Contains(s, "MESSAGE") && strings.Contains(s, "Catalog") &&
+		if strings.Contains(s, "MESSAGE") && strings.Contains(s, "<CmdType>Catalog</CmdType>") &&
 			strings.Contains(s, "SumNum") && strings.Contains(s, "34020000001320000002") {
 			sawCatalog = true
 		}

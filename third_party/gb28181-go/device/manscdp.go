@@ -445,8 +445,20 @@ func BuildCatalogResponseMessage(sn, deviceID string, items []ChannelItem) SipMe
 // multi-MESSAGE Catalog answer (A.2.6.1): SumNum carries the TOTAL
 // across all pages (the platform accumulates by SN until it holds
 // SumNum items), DeviceList Num carries this page's count.
+// catalogResponseBody emits Catalog answers in GB/T 28181 child-element form.
+// Field platforms that detect answers with strstr("<CmdType>Catalog</CmdType>")
+// ignore attribute form <Response CmdType="Catalog" ...> and never show the directory.
+type catalogResponseBody struct {
+	XMLName    xml.Name    `xml:"Response"`
+	CmdType    string      `xml:"CmdType"`
+	SN         string      `xml:"SN"`
+	DeviceID   string      `xml:"DeviceID"`
+	SumNum     *int        `xml:"SumNum,omitempty"`
+	DeviceList *DeviceList `xml:"DeviceList,omitempty"`
+}
+
 func BuildCatalogResponseMessagePaged(sn, deviceID string, items []ChannelItem, sumNum int) SipMessage {
-	resp := Response{
+	resp := catalogResponseBody{
 		CmdType:  "Catalog",
 		SN:       sn,
 		DeviceID: deviceID,
@@ -518,7 +530,10 @@ func BuildKeepaliveMessage(sn, deviceID, status string) SipMessage {
 	if status == "" {
 		status = "OK"
 	}
-	notify := Notify{
+	// Element form is required: parsers that look for "<Notify>" and
+	// "<CmdType>Keepalive</CmdType>" reject attribute-form notifies, so
+	// the platform never refreshes the heartbeat and the device goes offline.
+	notify := NotifyElem{
 		CmdType:  "Keepalive",
 		SN:       sn,
 		DeviceID: deviceID,

@@ -53,7 +53,7 @@ func TestCatalogResponse_XMLWellFormed(t *testing.T) {
 	msg := BuildCatalogResponseMessage(sn, deviceID, items)
 
 	// Parse the XML back
-	var resp Response
+	var resp catalogResponseBody
 	if err := xml.Unmarshal([]byte(msg.Body), &resp); err != nil {
 		t.Fatalf("Failed to unmarshal Catalog response: %v", err)
 	}
@@ -181,14 +181,14 @@ func TestKeepalive_Format(t *testing.T) {
 	}
 
 	// Check XML body format
-	if !strings.Contains(msg.Body, `CmdType="Keepalive"`) {
+	if !strings.Contains(msg.Body, "<CmdType>Keepalive</CmdType>") {
 		t.Error("Keepalive message should contain CmdType=\"Keepalive\" attribute")
 	}
 	if !strings.Contains(msg.Body, "<Status>OK</Status>") {
 		t.Error("Keepalive message should contain <Status>OK</Status>")
 	}
-	if !strings.Contains(msg.Body, `SN="456"`) {
-		t.Error("Keepalive message should contain SN attribute")
+	if !strings.Contains(msg.Body, "<SN>456</SN>") {
+		t.Error("Keepalive message should contain element SN")
 	}
 	if !strings.Contains(msg.Body, "<DeviceID>34020000012000000001</DeviceID>") {
 		t.Error("Keepalive message should contain DeviceID")
@@ -237,10 +237,10 @@ func TestDispatch_CatalogQuery(t *testing.T) {
 	if queued[0].Method != "MESSAGE" {
 		t.Errorf("Expected queued method MESSAGE, got %s", queued[0].Method)
 	}
-	if !strings.Contains(queued[0].Body, `CmdType="Catalog"`) {
+	if !strings.Contains(queued[0].Body, "<CmdType>Catalog</CmdType>") {
 		t.Error("Queued response should be Catalog")
 	}
-	if !strings.Contains(queued[0].Body, `SN="789"`) {
+	if !strings.Contains(queued[0].Body, "<SN>789</SN>") {
 		t.Error("Queued response should echo SN")
 	}
 }

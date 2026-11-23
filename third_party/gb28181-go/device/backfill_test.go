@@ -108,7 +108,7 @@ func TestServer_MessageCatalogQueryQueuesResponse(t *testing.T) {
 	sendToServer(t, conn, port, query)
 
 	// Collect replies in one drain loop: the 200 OK first, then the
-	// queued catalog response (attribute-form MANSCDP) on a fresh MESSAGE.
+	// queued catalog response (element-form MANSCDP) on a fresh MESSAGE.
 	var catalog SipMessage
 	saw200 := false
 	deadline := time.Now().Add(5 * time.Second)
@@ -121,7 +121,7 @@ func TestServer_MessageCatalogQueryQueuesResponse(t *testing.T) {
 			saw200 = true
 			continue
 		}
-		if msg.Method == "MESSAGE" && strings.Contains(msg.Body, `CmdType="Catalog"`) {
+		if msg.Method == "MESSAGE" && strings.Contains(msg.Body, "<CmdType>Catalog</CmdType>") {
 			catalog = msg
 			break
 		}
@@ -129,7 +129,7 @@ func TestServer_MessageCatalogQueryQueuesResponse(t *testing.T) {
 
 	require.True(t, saw200, "MESSAGE must be answered 200 OK")
 	require.NotEmpty(t, catalog.Body, "catalog response must be queued and sent")
-	require.Contains(t, catalog.Body, `SN="7"`, "response echoes the query SN")
+	require.Contains(t, catalog.Body, "<SN>7</SN>", "response echoes the query SN")
 	require.Contains(t, catalog.Body, "34020000001320000001", "response lists the channel")
 }
 

@@ -17,9 +17,10 @@ import (
 //
 //   - GB2312-declared MANSCDP bodies (the 2011 signaling charset, §6.10
 //     lineage) parse through the dispatch routes;
-//   - catalog / DeviceInfo / DeviceStatus queries in the 2011
-//     child-element form draw attribute-form Responses
-//     (CmdType/SN as attributes) a 2011 parser consumes;
+//   - catalog queries in the 2011 child-element form draw child-element
+//     Responses (`<CmdType>Catalog</CmdType>`) that 2011-era and field
+//     platforms recognize; DeviceInfo / DeviceStatus still use attribute
+//     form until those builders are similarly aligned;
 //   - the INVITE answer SDP is 2011-shaped: y= SSRC, PS/90000 rtpmap,
 //     sendonly, and no f= media-parameter line and no a=setup /
 //     a=connection (TCP media and the f= field are 2016 additions);
@@ -50,7 +51,7 @@ func TestDispatch_GB2011QueriesGB2312Declared(t *testing.T) {
 				"<Query>\r\n<CmdType>Catalog</CmdType><SN>101</SN>" +
 				"<DeviceID>" + devID + "</DeviceID>\r\n</Query>",
 			[]string{
-				`CmdType="Catalog"`, `SN="101"`, "<DeviceID>" + devID + "</DeviceID>",
+				"<CmdType>Catalog</CmdType>", "<SN>101</SN>", "<DeviceID>" + devID + "</DeviceID>",
 				"<SumNum>1</SumNum>", `<DeviceList Num="1">`, "<Status>ON</Status>",
 			},
 		},
@@ -92,9 +93,14 @@ func TestDispatch_GB2011QueriesGB2312Declared(t *testing.T) {
 					t.Errorf("response body missing %q:\n%s", w, queued[0].Body)
 				}
 			}
-			// The 2011 parser reads the attribute form; an element-form
-			// <CmdType> child would be a regression.
-			if strings.Contains(queued[0].Body, "<CmdType>") {
+			// Catalog answers use child-element CmdType so field platforms
+			// that strstr("<CmdType>Catalog</CmdType>") can see the directory.
+			// DeviceInfo / DeviceStatus builders still emit attributes.
+			if tc.name == "Catalog" {
+				if !strings.Contains(queued[0].Body, "<CmdType>Catalog</CmdType>") {
+					t.Errorf("catalog response must use element-form CmdType:\n%s", queued[0].Body)
+				}
+			} else if strings.Contains(queued[0].Body, "<CmdType>") {
 				t.Errorf("response must carry CmdType/SN as attributes, got element form:\n%s", queued[0].Body)
 			}
 		})

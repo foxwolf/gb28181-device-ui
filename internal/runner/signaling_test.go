@@ -111,11 +111,11 @@ func TestRunner_CatalogQueryAnswersMANSCDP(t *testing.T) {
 		if strings.HasPrefix(s, "SIP/2.0 200") {
 			saw200 = true
 		}
-		if strings.Contains(s, "MESSAGE") && strings.Contains(s, "Catalog") &&
+		if strings.Contains(s, "MESSAGE") && strings.Contains(s, "<CmdType>Catalog</CmdType>") &&
 			strings.Contains(s, "SumNum") && strings.Contains(s, cfg.ChannelID) {
 			sawCatalog = true
-			if !strings.Contains(s, `SN="77"`) && !strings.Contains(s, "<SN>77</SN>") {
-				t.Fatalf("Catalog Response missing SN=77:\n%s", s)
+			if !strings.Contains(s, "<SN>77</SN>") {
+				t.Fatalf("Catalog Response missing element SN=77:\n%s", s)
 			}
 		}
 		if saw200 && sawCatalog {
@@ -278,3 +278,66 @@ func TestRunner_InviteRejectsBadSDPWith488(t *testing.T) {
 
 // Ensure the device package builders the UI depends on stay importable.
 var _ = device.Config{}
+
+
+// TestRunner_CatalogQuery_GatewayWireFormat sends a Catalog Query using the
+// same child-element GB2312 body and Content-Type as sdSecureGateway, then
+// requires SIP 200 plus an element-form Catalog Response that the gateway's
+// strstr("<CmdType>Catalog</CmdType>") check would accept. Uses ephemeral
+// ports only (never 5060/15091).
+func TestRunner_CatalogQuery_GatewayWireFormat(t *testing.T) {
+	port, plat, stop := startUIDevice(t)
+	defer stop()
+
+	cfg := appconfig.Defaults()
+	body := "<?xml version=\"1.0\" encoding=\"GB2312\"?>\r\n" +
+		"<Query>\r\n" +
+		"<CmdType>Catalog</CmdType>\r\n" +
+		"<SN>6</SN>\r\n" +
+		"<DeviceID>" + cfg.DeviceID + "</DeviceID>\r\n" +
+		"</Query>\r\n"
+	platPort := plat.LocalAddr().(*net.UDPAddr).Port
+	if platPort == 5060 || port == 15091 || platPort == 15091 || port == 5060 {
+		t.Fatalf("refusing to use reserved field ports device=%d platform=%d", port, platPort)
+	}
+	wire := fmt.Sprintf("MESSAGE sip:%s@127.0.0.1:%d SIP/2.0\r\n"+
+		"Via: SIP/2.0/UDP 127.0.0.1:%d;rport;branch=z9hG4bKgw-cat\r\n"+
+		"From: <sip:35080000002000000001@127.0.0.1:%d>;tag=p\r\n"+
+		"To: <sip:%s@127.0.0.1:%d>\r\n"+
+		"Call-ID: 6gwcat@plat\r\nCSeq: 6 MESSAGE\r\n"+
+		"Max-Forwards: 70\r\n"+
+		"Content-Type: Application/MANSCDP+xml;charset=GB2312\r\n"+
+		"Content-Length: %d\r\n\r\n%s",
+		cfg.DeviceID, port, platPort, platPort, cfg.DeviceID, port, len(body), body)
+	writeSIP(t, plat, port, wire)
+
+	saw200, sawCatalog := false, false
+	var last string
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		s, ok := readSIP(t, plat, 400*time.Millisecond)
+		if !ok {
+			continue
+		}
+		last = s
+		if strings.HasPrefix(s, "SIP/2.0 200") {
+			saw200 = true
+		}
+		if strings.Contains(s, "MESSAGE") &&
+			strings.Contains(s, "<CmdType>Catalog</CmdType>") &&
+			strings.Contains(s, "<Response>") &&
+			strings.Contains(s, "<SN>6</SN>") &&
+			strings.Contains(s, cfg.ChannelID) {
+			sawCatalog = true
+		}
+		if saw200 && sawCatalog {
+			break
+		}
+	}
+	if !saw200 {
+		t.Fatalf("gateway-style Catalog Query must get SIP 200 OK; last=\n%s", last)
+	}
+	if !sawCatalog {
+		t.Fatalf("gateway-style Catalog Query must get element-form Catalog Response; last=\n%s", last)
+	}
+}
