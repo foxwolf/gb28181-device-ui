@@ -1803,6 +1803,11 @@ func (s *Server) handleInvite(ctx context.Context, msg SipMessage, fromAddr net.
 				psData := MuxH264ToPS(naluBytes, au.KeyFrame, au.Timestamp, au.Timestamp)
 				// Send PS data over RTP
 				if err := pusher.SendFrame(psData, au.KeyFrame, au.Timestamp, ssrc); err != nil {
+					if tcpConn != nil && isUnrecoverableMediaSendError(err, true) {
+						slog.Warn("gb28181: media TCP send failed permanently, stopping media session", "error", err)
+						s.stopCurrentMediaIf(tcpConn)
+						return
+					}
 					slog.Warn("gb28181: failed to send RTP frame", "error", err)
 				}
 			}
