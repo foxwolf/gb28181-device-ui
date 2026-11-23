@@ -1,0 +1,559 @@
+// GB/T 28181-2016 § 9.4 语音对讲 (voice intercom): the platform INVITEs the
+// device with an audio-only SDP (G.711 A-law, a=sendrecv), the device's 200
+// OK carries its receive address, and the platform streams RTP/G.711A to it.
+// Audio enters via the /api/cameras/{id}/gb28181/talk WebSocket (browser
+// mic → G.711A frames) and is packetized here.
+
+package sip
+
+import (
+	"fmt"
+	"log/slog"
+	"net"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/pion/rtp"
+
+	"github.com/ghettovoice/gosip/sip"
+	"github.com/mickeyzzc/gb28181-go/manscdp"
+	"github.com/mickeyzzc/gb28181-go/platform"
+)
+
+// talkRTPPayloadType is PCMA (G.711 A-law) — the GB28181 talk default.
+const talkRTPPayloadType = 8
+
+// talkMaxFrame guards against absurd WS frames (a 20ms G.711A chunk is
+// 160 bytes; even 1s chunks stay far below this).
+const talkMaxFrame = 8192
+
+// talkSession is one active voice intercom on a channel.
+type talkSession struct {
+	cameraID  string
+	deviceID  string
+	channelID string
+	callID    string
+
+	conn   *net.UDPConn // local sending socket; its port is advertised in the SDP offer
+	target *net.UDPAddr // device's audio receive address from the 200 OK SDP
+
+	ssrc uint32
+	mu   sync.Mutex
+	seq  uint16
+	ts   uint32
+
+	// GB35114 B/C on the downlink audio: cryptor XORs each frame under the
+	// session VEK (level C), signer SM2-signs each frame (level B) with the
+	// signature riding an RFC 8285 extension. uplinkVerifier checks the
+	// device's return-audio signatures (same session). All nil = plaintext.
+	cryptor        platform.RTPCryptor
+	signer         func(au []byte, ssrc, timestamp uint32) ([]byte, error)
+	uplinkVerifier func(au []byte, ssrc, timestamp uint32, sig []byte) error
+	onVerifyFailed func() // observability bridge for dropped return-audio
+
+	dialog *inviteDialog
+
+	closed    bool
+	packets   int64
+	bytesSent int64
+	// Uplink legs of the a=sendrecv offer: devices with talkback upstream
+	// send return PCMA to the advertised port (wire-verified as symmetric
+	// RTP at the send cadence). #141.
+	uplinkPackets int64
+	uplinkBytes   int64
+	uplinkSSRC    uint32
+	uplinkCB      func(channelID string, payload []byte) // captured from Server.OnTalkUplink at session start
+	lastMetric    time.Time
+}
+
+// StartTalk establishes a voice intercom with a channel: audio-only INVITE
+// (s=Play, m=audio <port> RTP/AVP 8, a=sendrecv) → 200 OK → ACK. Idempotent:
+// an existing session returns nil.
+func (s *Server) StartTalk(cameraID, deviceID, channelID string) error {
+	s.talkMu.Lock()
+	if t := s.talks[channelID]; t != nil {
+		s.talkMu.Unlock()
+		return nil
+	}
+	s.talkMu.Unlock()
+
+	s.mu.Lock()
+	srv := s.gosipSrv
+	s.mu.Unlock()
+	if srv == nil {
+		return fmt.Errorf("gb28181: SIP server not started")
+	}
+	dev, ok := s.deviceMgr.Device(deviceID)
+	if !ok {
+		return fmt.Errorf("gb28181: device %q not registered", deviceID)
+	}
+	dev.Mu.RLock()
+	netAddr := dev.NetAddr
+	dev.Mu.RUnlock()
+	serverHost := s.localIPFor(netAddr)
+
+	// Local UDP socket: its port is both the SDP offer port and the sending
+	// socket (devices that stream back talk-audio reach us here too).
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: 0})
+	if err != nil {
+		return fmt.Errorf("gb28181: talk udp socket: %w", err)
+	}
+	localPort := conn.LocalAddr().(*net.UDPAddr).Port
+
+	s.talkMu.Lock()
+	s.talkSeq++
+	seqNo := s.talkSeq
+	s.talkMu.Unlock()
+	ssrcStr := manscdp.SSRC(false, s.cfg.ServerID, 6000+seqNo%1000)
+	ssrc, _ := strconv.ParseUint(ssrcStr, 10, 32)
+
+	sdp := fmt.Sprintf("v=0\r\n"+
+		"o=%s 0 0 IN IP4 %s\r\n"+
+		"s=Play\r\n"+
+		"c=IN IP4 %s\r\n"+
+		"t=0 0\r\n"+
+		"m=audio %d RTP/AVP %d\r\n"+
+		"a=sendrecv\r\n"+
+		"y=%s\r\n",
+		s.cfg.ServerID, serverHost, serverHost, localPort, talkRTPPayloadType, ssrcStr)
+
+	// GB35114 B/C on platform-sent media: negotiate before the INVITE goes
+	// out — the offer carries the a=security attribute (with the sealed VEK
+	// at C) and the session gets the encryptor/signer. A C-level request
+	// with no security session fails closed rather than talking plaintext.
+	var talkCryptor platform.RTPCryptor
+	var talkSigner func(au []byte, ssrc, timestamp uint32) ([]byte, error)
+	var talkUplinkVerifier func(au []byte, ssrc, timestamp uint32, sig []byte) error
+	var talkVerifyFailed func()
+	if neg, ok := s.cfg.RegisterAuthenticator.(MediaSecurityNegotiator); ok && neg != nil {
+		offerValue, encrypt, sign, err := neg.NewMediaEncryptor(deviceID)
+		if err != nil {
+			conn.Close()
+			return fmt.Errorf("gb28181: talk media security for %s: %w", deviceID, err)
+		}
+		if offerValue != "" {
+			sdp += "a=security:" + offerValue + "\r\n"
+			talkCryptor, talkSigner = encrypt, sign
+			if sign != nil {
+				// The device signs its return audio with its certificate's
+				// key; the platform verifies through the same negotiator.
+				talkUplinkVerifier = func(au []byte, ssrc, timestamp uint32, sig []byte) error {
+					return neg.VerifyMediaSignature(deviceID, au, ssrc, timestamp, sig)
+				}
+				talkVerifyFailed = func() { s.metrics.GB35114AUVerifyFailed(channelID) }
+			}
+		}
+	}
+
+	devHost, devPortStr, err := net.SplitHostPort(netAddr)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("gb28181: invalid device address %q: %w", netAddr, err)
+	}
+	devPort, _ := strconv.Atoi(devPortStr)
+	portVal := sip.Port(devPort)
+
+	from := &sip.Address{
+		DisplayName: sip.String{Str: s.cfg.ServerID},
+		Uri:         &sip.SipUri{FUser: sip.String{Str: s.cfg.ServerID}, FHost: serverHost},
+	}
+	to := &sip.Address{
+		DisplayName: sip.String{Str: channelID},
+		Uri:         &sip.SipUri{FUser: sip.String{Str: channelID}, FHost: devHost, FPort: &portVal},
+	}
+	recipient := &sip.SipUri{FUser: sip.String{Str: channelID}, FHost: devHost, FPort: &portVal, FUriParams: s.deviceTransportParams(deviceID)}
+	subject := fmt.Sprintf("%s:%s,%s:0", channelID, ssrcStr, s.cfg.ServerID)
+
+	req, err := s.buildRequest(sip.INVITE, serverHost, from, to, recipient, subject, "application/sdp", sdp)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("gb28181: build talk INVITE: %w", err)
+	}
+	s.decorateOutgoing(deviceID, req)
+	tx, err := srv.Request(req)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("gb28181: send talk INVITE to %s: %w", channelID, err)
+	}
+	resp, err := s.awaitInviteAnswer(srv, tx, req)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("gb28181: talk INVITE to %s: %w", channelID, err)
+	}
+	if resp == nil {
+		conn.Close()
+		return fmt.Errorf("gb28181: talk INVITE to %s: no matched answer", channelID)
+	}
+
+	// Device's audio receive address from the answer SDP (m=audio).
+	host, port, ok := sdpAudioAddress([]byte(resp.Body()))
+	if !ok {
+		// Some firmwares answer video-form SDPs; without a usable media
+		// address we cannot deliver audio — fail the talk cleanly.
+		ack := sip.NewAckRequest("", req, resp, "", nil)
+		_ = srv.Send(ack)
+		byeErr := s.sendByeForTalk(req, resp)
+		conn.Close()
+		if byeErr != nil {
+			slog.Debug("gb28181: talk cleanup BYE failed", "channel", channelID, "error", byeErr)
+		}
+		return fmt.Errorf("gb28181: talk answer SDP carries no usable audio address")
+	}
+
+	ack := sip.NewAckRequest("", req, resp, "", nil)
+	if err := srv.Send(ack); err != nil {
+		conn.Close()
+		return fmt.Errorf("gb28181: send talk ACK: %w", err)
+	}
+
+	callID := ""
+	if cid, ok := resp.CallID(); ok {
+		callID = cid.String()
+	}
+	t := &talkSession{
+		cameraID:       cameraID,
+		deviceID:       deviceID,
+		channelID:      channelID,
+		callID:         callID,
+		conn:           conn,
+		target:         &net.UDPAddr{IP: net.ParseIP(host), Port: int(port)},
+		ssrc:           uint32(ssrc),
+		cryptor:        talkCryptor,
+		signer:         talkSigner,
+		uplinkVerifier: talkUplinkVerifier,
+		onVerifyFailed: talkVerifyFailed,
+		dialog:         &inviteDialog{req: req, resp: resp},
+	}
+	s.talkMu.Lock()
+	s.talks[channelID] = t
+	s.talkMu.Unlock()
+	t.uplinkCB = s.OnTalkUplink // captured once — the read loop never touches the Server field
+	go t.uplinkReadLoop()
+	slog.Info("gb28181: talk session established",
+		"channel", channelID, "device", deviceID, "target", t.target, "ssrc", ssrcStr)
+	return nil
+}
+
+// WriteTalkAudio packetizes one G.711 A-law frame as RTP/PCMA and sends it
+// to the device. On GB35114 sessions the frame is first signed (level B,
+// signature over the plaintext, carried in an RFC 8285 extension) and then
+// encrypted (level C). Silently drops frames after StopTalk raced a writer.
+func (s *Server) WriteTalkAudio(channelID string, alaw []byte) {
+	if len(alaw) == 0 || len(alaw) > talkMaxFrame {
+		return
+	}
+	s.talkMu.Lock()
+	t := s.talks[channelID]
+	s.talkMu.Unlock()
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	t.seq++
+	seq, ts, ssrc := t.seq, t.ts, t.ssrc
+	var sigDER []byte
+	if t.signer != nil {
+		sig, err := t.signer(alaw, ssrc, ts)
+		if err != nil {
+			t.mu.Unlock()
+			slog.Debug("gb28181: talk AU signing failed", "channel", channelID, "error", err)
+			return
+		}
+		sigDER = sig
+	}
+	payload := alaw
+	if t.cryptor != nil {
+		payload = t.cryptor.Crypt(alaw, ssrc, seq)
+	}
+	packet := &rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			PayloadType:    uint8(talkRTPPayloadType),
+			SequenceNumber: seq,
+			Timestamp:      ts,
+			SSRC:           ssrc,
+		},
+		Payload: payload,
+	}
+	if sigDER != nil {
+		packet.Header.ExtensionProfile = rtp.ExtensionProfileTwoByte
+		if err := packet.SetExtension(platform.RTPExtAUSignature, sigDER); err != nil {
+			t.mu.Unlock()
+			slog.Debug("gb28181: talk RTP extension failed", "channel", channelID, "error", err)
+			return
+		}
+	}
+	pkt, err := packet.Marshal()
+	if err != nil {
+		t.mu.Unlock()
+		slog.Debug("gb28181: talk RTP marshal failed", "channel", channelID, "error", err)
+		return
+	}
+	// G.711 is one sample per byte at 8kHz — the sample count equals the
+	// payload length.
+	t.ts += uint32(len(alaw))
+	_, err = t.conn.WriteToUDP(pkt, t.target)
+	if err == nil {
+		t.packets++
+		t.bytesSent += int64(len(alaw))
+	}
+	t.mu.Unlock()
+	if err != nil {
+		slog.Debug("gb28181: talk audio send failed", "channel", channelID, "error", err)
+		return
+	}
+	// Liveness log at most once a minute.
+	if time.Since(t.lastMetric) > time.Minute {
+		t.mu.Lock()
+		t.lastMetric = time.Now()
+		pk, by := t.packets, t.bytesSent
+		t.mu.Unlock()
+		slog.Debug("gb28181: talk streaming", "channel", channelID, "packets", pk, "audio_bytes", by)
+	}
+}
+
+// StopTalk tears the intercom down: in-dialog BYE, socket close, cleanup.
+func (s *Server) StopTalk(channelID string) error {
+	s.talkMu.Lock()
+	t := s.talks[channelID]
+	delete(s.talks, channelID)
+	s.talkMu.Unlock()
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	t.closed = true
+	conn, dlg := t.conn, t.dialog
+	pk, by := t.packets, t.bytesSent
+	upk, upby := t.uplinkPackets, t.uplinkBytes
+	if t.cryptor != nil {
+		t.cryptor.Zero()
+		t.cryptor = nil
+	}
+	t.mu.Unlock()
+	conn.Close()
+	slog.Info("gb28181: talk session stopped",
+		"channel", channelID, "packets", pk, "audio_bytes", by,
+		"uplink_packets", upk, "uplink_audio_bytes", upby)
+	return s.sendByeForTalk(dlg.req, dlg.resp)
+}
+
+// TalkStatusFor reports the active intercom state of a camera's channel
+// (nil-status when idle).
+func (s *Server) TalkStatusFor(cameraID string) platform.TalkStatus {
+	s.talkMu.Lock()
+	defer s.talkMu.Unlock()
+	for _, t := range s.talks {
+		if t.cameraID == cameraID {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			return platform.TalkStatus{
+				Active:        true,
+				CameraID:      t.cameraID,
+				ChannelID:     t.channelID,
+				Packets:       t.packets,
+				BytesSent:     t.bytesSent,
+				UplinkPackets: t.uplinkPackets,
+				UplinkBytes:   t.uplinkBytes,
+				UplinkSSRC:    t.uplinkSSRC,
+			}
+		}
+	}
+	return platform.TalkStatus{Active: false}
+}
+
+// uplinkReadLoop drains return-audio RTP from the talk socket until it
+// closes (StopTalk / device BYE). Devices with talkback upstream stream
+// PCMA back to the port the offer advertised — symmetric RTP at the send
+// cadence (wire-verified); nothing consumed it before #141. Malformed or
+// non-PCMA frames are dropped silently so a chatty peer cannot wedge the
+// session.
+func (t *talkSession) uplinkReadLoop() {
+	buf := make([]byte, 2048)
+	var pkt rtp.Packet
+	for {
+		n, _, err := t.conn.ReadFromUDP(buf)
+		if err != nil {
+			return // socket closed — the normal teardown path
+		}
+		if err := pkt.Unmarshal(buf[:n]); err != nil {
+			continue
+		}
+		if pkt.Header.PayloadType != uint8(talkRTPPayloadType) {
+			continue
+		}
+		payload := append([]byte(nil), pkt.Payload...)
+		ssrc := pkt.Header.SSRC
+		// GB35114 B/C on the return audio: decrypt (level C — same session
+		// VEK, symmetric XOR) and verify the per-packet signature against
+		// the device certificate (level B). Fail closed drops the packet.
+		t.mu.Lock()
+		closed := t.closed
+		cryptor := t.cryptor
+		verifier := t.uplinkVerifier
+		t.mu.Unlock()
+		if closed {
+			return
+		}
+		if cryptor != nil {
+			payload = cryptor.Crypt(payload, ssrc, pkt.Header.SequenceNumber)
+		}
+		if verifier != nil {
+			sig := pkt.Header.GetExtension(platform.RTPExtAUSignature)
+			drop := len(sig) == 0
+			if !drop && verifier(payload, ssrc, pkt.Header.Timestamp, sig) != nil {
+				drop = true
+			}
+			if drop {
+				if t.onVerifyFailed != nil {
+					t.onVerifyFailed()
+				}
+				continue
+			}
+		}
+		t.mu.Lock()
+		t.uplinkPackets++
+		t.uplinkBytes += int64(len(payload))
+		t.uplinkSSRC = ssrc
+		t.mu.Unlock()
+		if cb := t.uplinkCB; cb != nil {
+			cb(t.channelID, payload)
+		}
+	}
+}
+
+// stopTalkOnBye ends a talk session whose BYE arrived from the device
+// (matched by Call-ID). Returns true when the BYE belonged to a talk dialog.
+func (s *Server) stopTalkOnBye(req sip.Request) bool {
+	callID, ok := req.CallID()
+	if !ok {
+		return false
+	}
+	s.talkMu.Lock()
+	defer s.talkMu.Unlock()
+	for chID, t := range s.talks {
+		if t.callID != "" && t.callID == callID.String() {
+			t.mu.Lock()
+			t.closed = true
+			conn := t.conn
+			t.mu.Unlock()
+			conn.Close()
+			delete(s.talks, chID)
+			slog.Info("gb28181: talk BYE received from device", "channel", chID)
+			return true
+		}
+	}
+	return false
+}
+
+// sendByeForTalk transmits an in-dialog BYE for a talk session.
+func (s *Server) sendByeForTalk(inviteReq sip.Request, inviteResp sip.Response) error {
+	s.mu.Lock()
+	srv := s.gosipSrv
+	s.mu.Unlock()
+	if srv == nil {
+		return fmt.Errorf("gb28181: SIP server not started")
+	}
+	fromHdr, hasFrom := inviteResp.From()
+	toHdr, hasTo := inviteResp.To()
+	if !hasFrom || !hasTo {
+		return nil
+	}
+	callID, hasCallID := inviteResp.CallID()
+	seq := uint(1)
+	if cseq, ok := inviteResp.CSeq(); ok {
+		seq = uint(cseq.SeqNo) + 1
+	}
+	serverHost := s.localIPFor(inviteReq.Recipient().String())
+	_, sipPort, err := parseSIPListen(s.cfg.SIPListen)
+	if err != nil {
+		sipPort = 5060
+	}
+	sipPortVal := sip.Port(sipPort)
+
+	rb := sip.NewRequestBuilder()
+	rb.SetMethod(sip.BYE)
+	rb.SetFrom(&sip.Address{DisplayName: fromHdr.DisplayName, Uri: fromHdr.Address})
+	rb.SetTo(&sip.Address{DisplayName: toHdr.DisplayName, Uri: toHdr.Address})
+	if hasCallID {
+		rb.SetCallID(callID)
+	}
+	rb.SetRecipient(inviteReq.Recipient())
+	rb.SetHost(serverHost)
+	rb.AddVia(&sip.ViaHop{
+		Host:   serverHost,
+		Port:   &sipPortVal,
+		Params: sip.NewParams().Add("branch", sip.String{Str: sip.GenerateBranch()}),
+	})
+	rb.SetSeqNo(seq)
+	byeReq, err := rb.Build()
+	if err != nil {
+		return fmt.Errorf("gb28181: build talk BYE: %w", err)
+	}
+	if _, err := srv.Request(byeReq); err != nil {
+		return fmt.Errorf("gb28181: send talk BYE: %w", err)
+	}
+	return nil
+}
+
+// sdpAudioAddress extracts the connection address and m=audio media port
+// from an SDP body (talk answers carry audio, not video, media lines).
+func sdpAudioAddress(sdp []byte) (string, uint16, bool) {
+	host := ""
+	port := 0
+	for _, line := range splitCRLF(string(sdp)) {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "c=IN IP4 ") {
+			host = strings.TrimSpace(strings.TrimPrefix(line, "c=IN IP4"))
+		} else if strings.HasPrefix(line, "m=audio ") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				if p, err := strconv.Atoi(fields[1]); err == nil {
+					port = p
+				}
+			}
+		}
+	}
+	if host == "" || port <= 0 || port > 65535 || net.ParseIP(host) == nil {
+		return "", 0, false
+	}
+	return host, uint16(port), true
+}
+
+// sdpAudioCodec extracts the audio codec an SDP body declares on its m=audio
+// media line: PCMA→g711a, PCMU→g711u, mpeg4-generic→aac. Returns "" when the
+// body declares no usable audio codec. Used to seed the PS demuxer's no-PSM
+// audio fallback for devices that mux audio into the PS stream without ever
+// sending a Program Stream Map.
+func sdpAudioCodec(sdp []byte) string {
+	inAudio := false
+	for _, line := range splitCRLF(string(sdp)) {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "m="):
+			inAudio = strings.HasPrefix(line, "m=audio ")
+		case inAudio && strings.HasPrefix(line, "a=rtpmap:"):
+			// a=rtpmap:<pt> <encoding>/<clock> [/<params>] — compare the
+			// encoding name only, before the clock separator.
+			fields := strings.Fields(strings.TrimPrefix(line, "a=rtpmap:"))
+			if len(fields) < 2 {
+				continue
+			}
+			switch strings.ToUpper(strings.SplitN(fields[1], "/", 2)[0]) {
+			case "PCMA":
+				return platform.AudioCodecG711A
+			case "PCMU":
+				return platform.AudioCodecG711U
+			case "MPEG4-GENERIC":
+				return platform.AudioCodecAAC
+			}
+		}
+	}
+	return ""
+}

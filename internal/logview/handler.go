@@ -123,6 +123,17 @@ func (b *Buffer) Lines() []Line {
 	return out
 }
 
+// Clear 清空当前日志缓存与显示内容，不影响会话状态（注册/心跳等）。
+func (b *Buffer) Clear() {
+	b.mu.Lock()
+	b.lines = b.lines[:0]
+	onChange := b.onChange
+	b.mu.Unlock()
+	if onChange != nil {
+		onChange()
+	}
+}
+
 // Dump 返回当前窗口中的全部日志文本（已脱敏），便于复制到剪贴板。
 func (b *Buffer) Dump() string {
 	lines := b.Lines()

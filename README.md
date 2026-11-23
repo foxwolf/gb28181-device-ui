@@ -6,19 +6,13 @@
 
 ## 依赖
 
-本仓库通过 `go.mod` 里的 `replace` 引用同级目录中的上游库，**不要修改** `gb28181-go`：
+本仓库通过 `go.mod` 里的 `replace` 引用内置的设备侧库副本（含 Catalog / INVITE 等应答修复）：
 
 ```
-replace github.com/mickeyzzc/gb28181-go => ../gb28181-go
+replace github.com/mickeyzzc/gb28181-go => ./third_party/gb28181-go
 ```
 
-拷贝到 Windows 后，目录关系应是：
-
-```
-E:\src\contribs\gb28181-go
-E:\src\contribs\gb28181-device-ui
-```
-
+本地若仍要联调同级上游源码，可临时改回 `../gb28181-go`，但请自行合并 `third_party/gb28181-go` 中与信令应答相关的修复。默认请使用仓库内 `third_party` 副本，保证平台 Catalog / 点播 INVITE 等应答行为一致。
 ## 重要说明
 
 - **视频源可切换。** 默认仍是库内合成的占位 H.264（每秒一帧，每 5 帧一个 IDR），平台上只能看到“有流”。也可以选择「本机摄像头（FFmpeg）」：程序会以外挂进程调用 `ffmpeg.exe`，经 DirectShow 采集摄像头并编成 H.264，再写入现有的 `FrameSource` 接口。界面和启动逻辑不绑定 FFmpeg，日后若以进程内方式（例如 pion/mediadevices）接入，只需再登记一个后端。
@@ -26,6 +20,7 @@ E:\src\contribs\gb28181-device-ui
 - **FFmpeg 需要自行准备。** 本仓库不附带 `ffmpeg.exe`。请把带 DirectShow（`dshow`）的 Windows 构建放到本程序同一目录，或加入系统 PATH；建议包含 `libx264`，没有的话会尝试回退到 `h264_mf`。若随程序再分发 FFmpeg，须遵守其 GPL/LGPL 许可。
 - **本机出发地址是路由探测出来的，不是绑定设置。** 库本身没有 `-local-ip` 参数；界面会对「平台地址:端口」做一次 UDP connect（不真正发报文），再用 getsockname 显示内核会选用的源 IP，并在平台地址变化或点击「启动」时刷新。这正是为了核对流量是否从 `192.168.10.0/24` 一侧出发，而不是像 EasyGBD 那样自动选到别的网卡（例如 `192.168.4.170`）。
 - **密码不会随仓库分发。** 源码默认值和本 README 都不含 SIP 密码。启动前必须在界面填写与平台约定的认证密码，否则会拒绝启动。密码只会写进可执行文件旁边的本地文件 `gb28181-device-ui.json`（已列入 `.gitignore`），请勿把该文件提交或拷贝到仓库里。
+- **近期修复说明。** 2026-11 目录应答与心跳 XML、日志滚动与清除、媒体 TCP 断连处理、以及多 slice 合帧等经过验证的说明，见 [docs/修改日志-2026-11-信令目录与媒体修复.md](docs/修改日志-2026-11-信令目录与媒体修复.md)。
 
 ## 在 WSL 里交叉编译
 

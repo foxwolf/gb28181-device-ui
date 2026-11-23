@@ -60,7 +60,14 @@ func (u *UI) layoutLogText(gtx C) D {
 
 	n := len(lines)
 	heights := make([]int, n)
-	dims := u.logList.Layout(gtx, max(n, 1), func(gtx C, i int) D {
+	style := material.List(u.th, &u.logList)
+	style.AnchorStrategy = material.Occupy
+	style.Indicator.MinorWidth = unit.Dp(8)
+	style.Indicator.Color = rgb(0x8A96A3)
+	style.Indicator.HoverColor = rgb(0x52606D)
+	style.Track.Color = rgb(0xE4E7EB)
+	barW := gtx.Dp(style.Width())
+	dims := style.Layout(gtx, max(n, 1), func(gtx C, i int) D {
 		if n == 0 {
 			l := material.Label(u.th, unit.Sp(12), "暂无日志")
 			l.Color = rgb(0x7A869A)
@@ -74,7 +81,10 @@ func (u *UI) layoutLogText(gtx C) D {
 	})
 
 	u.logHits = u.logHits[:0]
-	u.logWidth = gtx.Constraints.Max.X
+	u.logWidth = gtx.Constraints.Max.X - barW
+	if u.logWidth < 1 {
+		u.logWidth = 1
+	}
 	y := -u.logList.Position.Offset
 	if n > 0 {
 		for i := 0; i < u.logList.Position.Count; i++ {
@@ -91,17 +101,34 @@ func (u *UI) layoutLogText(gtx C) D {
 		}
 	}
 
-	if u.logDragging {
-		u.stickBottom = false
+	if u.logDragging || u.logList.Scrollbar.Dragging() {
+		u.stickBottom = !u.logList.Position.BeforeEnd
 	} else if !u.logFocused || !u.hasLogSelection() {
 		u.stickBottom = !u.logList.Position.BeforeEnd
 	}
 
+	// 划选命中区避开滚动条，避免拖动滑块时同时触发文本选择。
+	textMax := image.Pt(gtx.Constraints.Max.X-barW, gtx.Constraints.Max.Y)
+	if textMax.X < 0 {
+		textMax.X = 0
+	}
 	defer pointer.PassOp{}.Push(gtx.Ops).Pop()
-	defer clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops).Pop()
+	defer clip.Rect{Max: textMax}.Push(gtx.Ops).Pop()
 	pointer.CursorText.Add(gtx.Ops)
 	event.Op(gtx.Ops, &u.logPtr)
 	return dims
+}
+
+// clearLogs 清空当前显示和缓冲，不影响设备注册/运行状态。
+func (u *UI) clearLogs() {
+	u.logs.Clear()
+	u.logStart, u.logEnd = logPos{}, logPos{}
+	u.logHits = u.logHits[:0]
+	u.logDragging = false
+	u.stickBottom = true
+	if u.win != nil {
+		u.win.Invalidate()
+	}
 }
 
 func (u *UI) layoutLogLine(gtx C, i int, line logview.Line) D {

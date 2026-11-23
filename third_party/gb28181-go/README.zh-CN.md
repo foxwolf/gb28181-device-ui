@@ -1,0 +1,181 @@
+[中文](README.zh-CN.md) | **English**
+
+# gb28181-go
+
+[![CI](https://github.com/mickeyzzc/gb28181-go/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyzzc/gb28181-go/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Language: Go](https://img.shields.io/badge/language-Go-00ADD8.svg)
+![Tests](https://img.shields.io/badge/tests-700%2B%20passing-brightgreen.svg)
+
+**GB/T 28181-2011/2016/2022 Go 库族** —— 中国国标视频监控的设备端（UAC）与平台端（UAS）双角色。设备角色可与 2011 世代平台互操作（见 [GB/T 28181-2011 设备侧兼容](#gbt-28181-2011-设备侧兼容)）。
+
+手写 SIP（设备端不依赖任何 SIP 框架；平台端构建于 [ghettovoice/gosip](https://github.com/ghettovoice/gosip) 之上）、MANSCDP XML 编解码、RTP/PS 媒体与会话编排。代码从 Mi-Bee Studio 生产实现逐字抽取，经真实国标平台打磨（摘要 qop=auth、Via branch 唯一性、本机 IP 探测、MANSCDP 属性形式、SIP over TCP、TCP 媒体）。
+
+## 包
+
+| 包 | 角色 | 来源 |
+|---|---|---|
+| `device/` | **UAC** —— 摄像头注册到 SIP 平台：REGISTER + 摘要认证、目录/设备信息/保活、INVITE 驱动的 RTP/PS 直播、RecordInfo、按帧节奏的回放/下载与 SIP INFO 控制。UDP、TCP（入站监听或 **tcp-out**——设备主动外拨平台并跑完整生命周期）与 SIPS（TLS，外向）——订阅/NOTIFY 对话、多条 MESSAGE 分页的目录/录像应答、异步抓图/升级通知在三种传输上均可运行（完成通知 INFO 走对话自身的传输）；流连接断开后由下个重注册周期自动重拨。媒体分发默认单播，**组播双向可用**——平台侧在 INVITE 的媒体地址为组播组时自动加入 IGMP 组（issue #111 后续），设备侧可向组播组发送并支持 `multicast_ttl` 配置。 | `mibee-eye-raspi-go` `internal/gb28181` |
+| `manscdp/` | 共享 MANSCDP XML 编解码（元素+属性双形式，GB2312/GBK/GB18030/UTF-8） | MiBeeNvr `internal/gb28181/manscdp` |
+| `platform/` | **UAS**（迁移批次 1–3/4 已入）—— 设备/通道注册表（保活离线判定）、MPEG-PS 解复用（含 PSM-less 音频回退启发式）、端口池、PTZ/A505 指令构建、RTP 接收/乱序重组（UDP + TCP 被动、抖动缓冲、SSRC 锁定）、INVITE/BYE 会话编排（FrameHub 扇出）。2022 标准的第二种封装——ES over RTP（issue #110）——同样可收：RFC 6184/7798 载荷（单 NALU / STAP-A / FU-A，H.265 单 NALU / AP / FU）去包化后产出与 PS 路径相同的 `[][]byte` AU 形态，按会话锁定，FrameHub 消费者与 AU/NALU 回调零改动。组播接收可用：INVITE 的媒体地址为组播组时会话自动加入 IGMP 组（issue #111 后续）。纯音频通道（表E.1 类型码 136 的语音输入设备/网络拾音器）像相机一样从目录入册：实时 INVITE 协商单条 `m=audio`（G.711 A 律、PT 8），接收器兼容裸 G.711 RTP 与 PS 封装音频；附录 C 音频流类型表完整（G.711 A/μ、G.722.1、G.723.1、G.729、AAC、SVAC——issue #135）。 | MiBeeNvr `internal/gb28181` |
+| `platform/sip/` | 基于 gosip 的 SIP UAS 服务器 —— REGISTER + 摘要认证（qop=auth）、保活/离线判定、目录刷新 + SUBSCRIBE（目录/报警/移动位置）、INVITE/BYE（含固件 quirk 补丁：speculative ACK、dialog reset、REGISTER 源端口轮换、长 GOP IDR watchdog）、回放/对讲域、报警联动拉流。持久化走 `DeviceStore` 接口；事件走内置有损 `EventBus`（`gb28181.alarm`、`gb28181.snapshot.finished`）。 | MiBeeNvr `internal/gb28181/sip` |
+| `psmux/` | PS/RTP 打包 muxer（H.264/H.265、G.711 音频、>60KB AU 分段、RTP 分片），设备端推流与平台/级联转发共用 | MiBeeNvr `internal/gb28181/psmux` |
+| `nalutil/` | NALU 工具（IDR 判定、参数集提取/比较）—— 平台收流与未来设备侧共用 | MiBeeNvr `internal/model/nalutil` |
+| `conformance/` | device↔platform 自回环 conformance 套件 —— 真实 `device.Server` 对真实平台 SIP 服务器（localhost）：REGISTER+摘要认证 → 目录 → 保活存活 → INVITE 直播 → 字节级 RTP/PS 往返 → BYE；另有 SIPS（TLS 信令）变体。两个角色必须在每次 CI 上对每一条协议理解达成一致。 | 新增（issue #13） |
+| `platform/cascade/` | 级联客户端 —— 本平台作为下级平台向上级平台注册：聚合目录上报（GB 通道 ID 首见分配、跨重启稳定）、INVITE 转发拉流（FrameHub 订阅 → psmux → RTP）、录像段回放、BYE/SUBSCRIBE/MESSAGE/INFO/OPTIONS 处理、协议级回环测试。本地摄像头经 `CameraSource` 注入、持久化经 `Store`、录像段读取经 `SegmentParser` —— 全部宿主接缝。 | MiBeeNvr `internal/gb28181/cascade` |
+| `security35114/` | **可选，build tag 隔离（`-tags gb35114`）** —— GB 35114-2017 **A/B/C 三级**安全，**设备/平台两侧**：设备侧基于 SM2 数字证书的 REGISTER 双向认证（`device.Config.RegisterAuthenticator`），平台侧挑战/验签/Note 校验状态机（`security35114.Platform`，经 `platform/sip` 的 `Config.RegisterAuthenticator` 接入）。`cryptkey` SM2 信封内的 VKEK 协商、后续信令的 keyed-SM3 `Note` 头完整性。 | 新增（v0.4.0，平台侧 v0.5.0） |
+
+## 使用（设备端）
+
+```go
+import "github.com/mickeyzzc/gb28181-go/device"
+
+cfg := device.Config{
+    PlatformSIPAddress: "192.168.1.10",
+    PlatformSIPPort:    5060,
+    DeviceID:           "34020000001320000001",
+    ChannelID:          "34020000001310000001",
+    SIPDomain:          "3402000000",
+    Password:           "your-platform-password", // 与平台约定的摘要认证密码——切勿在文档或代码里放真实值
+}
+
+srv := device.New(cfg, device.DeviceInfo{Name: "My Cam"}, frameSource)
+// frameSource 在你的采集帧中心上实现 device.FrameSource；
+// 可选 srv.SetRecordingIndex(...) 以支持 RecordInfo/回放。
+err := srv.Start(ctx)
+```
+
+宿主接缝（接口，宿主注入）：
+
+- `FrameSource` —— 直播 H.264 访问单元
+- `RecordingIndex` / `PlaybackIndex` —— 录像段索引（RecordInfo/回放）
+- `Config` / `DeviceInfo` —— 连接配置与设备身份（YAML 形状与来源项目一致）
+
+录像段使用 `device.OpenSegment` 读取的参考格式：裸 Annex-B H.264 + 每帧 `.ts.jsonl` sidecar。测试可使用现成的 `device.FrameHub`（有界通道、满则丢弃语义的 `FrameSource` 实现）。
+
+## GB35114 国密安全（A/B/C 三级，可选）
+
+[GB 35114-2017](https://openstd.samr.gov.cn/bzgk/std/newGbInfo?hcno=B7F5589329EF98B32F0EB8ACEC341C81) 在 GB/T 28181 之上叠加基于 SM2 数字证书的安全层——**A/B/C 三级全部实现**（B/C 媒体侧为 PS-over-RTP 软件形态：B 级逐 AU SM2 签名，C 级 VKEK 信封 VEK + SM4-OFB 载荷加密，经 INVITE SDP `a=security` 属性按会话协商；全部媒体方向覆盖——直播、回放/下载、双向对讲、语音广播、级联）。SVAC 原生（GB/T 25724 硬件编码器）流仍设计性不在范围。该包位于 `gb35114` build tag 之后，默认构建保持零额外依赖。专题手册（握手线格式、两侧接线、B/C 媒体安全、密钥管理、证书供给）：**[GB35114 国密手册](docs/zh-CN/gb28181-go-gb35114.md)**。
+
+```go
+// go build -tags gb35114
+import sec "github.com/mickeyzzc/gb28181-go/security35114"
+
+auth, err := sec.New(sec.Options{
+    Device:       devIdentity,     // sec.LoadIdentityFromFiles(cert, key)
+    PlatformCert: platCert,        // sec.LoadCertificate(cert) —— 用于验签 sign2
+    DeviceID:     "34020000001320000001",
+    ServerID:     "34020000002000000001",
+})
+cfg.RegisterAuthenticator = auth   // 取代 REGISTER 生命周期中的摘要认证
+```
+
+握手流程按标准文本并以真实抓包交叉校准：`Capability` 能力宣告 → 401 携带 `random1` → 带 `sign1` 的重注册（SM2 签名 random2‖random1‖serverID）→ 200 OK `SecurityInfo` 携带 SM2 封装的 VKEK（`cryptkey`，DER C1‖C3‖C2 信封）；`Bidirection` 模式另含平台 `sign2`。注册成功后，所有外出请求（保活等）携带以 VKEK 为密钥的 `Date` + `Note: Digest nonce="…",algorithm=SM3`。每个头域由 golden 字符串钉死；端到端测试用真实 `device.Server` 对抗假平台（验签 sign1、解封 VKEK、校验首条保活的 `Note`）。
+
+两处跨实现歧义点做成可配置项（`RandomEncoding`、`Sign2Order`）：签名负载中随机数的表示形式、`sign2` 的 R1/R2 操作数顺序。默认值遵循标准文本（拼接采用抓包观测的线格式字符串；R1 在前）。SM3/SM2 来自 [emmansun/gmsm](https://github.com/emmansun/gmsm)（纯 Go，GM/T 0015-2012 SM2 X.509 证书）。
+
+线格式注意事项：证书预置在带外完成（或对接受 `cnonce` 宣告的平台开启 `Options.IncludeDeviceCert`）。下行 `Note` 校验（v0.7.0）：握手完成后，平台发往设备的带 `Note` 请求会在设备侧用 VKEK 验签并检查 `Date` ±5 分钟新鲜度窗口——签名不符默认回 403（`device.Config.IncomingNotePolicy` 可选 `Warn`/`Off` 便于灰度），无 `Note` 的请求照旧放行（兼容混跑的 Digest 平台）。
+
+### 平台侧（UAS，v0.5.0）
+
+`security35114.Platform` 是面向 GB/T 28181 平台的镜像状态机：下发 `Bidirection`/`Unidirection` 挑战、用预置（或 `cnonce` 宣告的）设备证书验签 `sign1`、封装 VKEK、签名 `sign2`，并校验后续所有 `Note`。`platform/sip.Server` 把非 Digest 方案的 REGISTER 路由给它、在 200 OK 上附加 `SecurityInfo` 头 —— Digest 设备照旧走 `Password`，互不干扰：
+
+```go
+// go build -tags gb35114
+plat35114, err := sec.NewPlatform(sec.PlatformConfig{
+    ServerID:    "34020000002000000001",
+    Identity:    platIdentity, // 平台 SM2 签名证书+私钥 —— 用于 sign2
+    DeviceCerts: map[string]*smx509.Certificate{deviceID: devCert}, // 或信任 cnonce 宣告
+})
+sipCfg.RegisterAuthenticator = plat35114 // platform/sip.Config；Digest 路径不受影响
+```
+
+`Platform` 并发安全，会话按设备 ID 索引；设备重注册期间旧 VKEK 继续可验；对 SIP-over-UDP 重传的已完成 REGISTER 幂等返回同一 `SecurityInfo`；对过期 `random1`（重放）、方案错配、未知/不匹配设备证书以哨兵错误（`ErrChallengeMismatch`、`ErrDeviceCert` 等）拒绝，便于上层映射 4xx。进程内回环测试用真实 `device.Server`（设备侧认证器）对真实 `platform/sip.Server`（接入 `Platform`）跑通握手、VKEK 一致性与 `Note` 校验，全程真实 SM2/SM3。
+
+### GB28181-2022 抓拍与手动录像（issue #49）
+
+2022 版图像抓拍命令走设备配置通道（issue #107：`Control` 根、`CmdType=DeviceConfig` 携带 `SnapShotConfig`——`SnapNum`/`Interval`/`UploadURL`/`SessionID`，A.2.1.24，与 2022 实机报文一致）；`manscdp.Decode` 解析 `UploadSnapShotFinished` 完成通知（A.2.5.7，`SnapShotList`/`SnapShotFileID`）；`platform.PTZController` 新增 `SendSnapShotCmd` / `StartManualRecord` / `StopManualRecord`。 回放/下载会话自然结束时发送会话内 §9.4.2 `MediaStatus: Play Finished` / `Download Finished` SIP INFO（MANSRTSP 风格消息体，与 Rust 孪生字节一致），平台可立即停止拉流；BYE 侧拆除保持静默。UDP 传输。 §9.3.2 管理控制命令端到端落地（issue #81）：`DeviceControl` 解码 `IFrameCmd`（强制 I 帧——平台起流/丢包恢复时常发）、`RecordCmd`、`GuardCmd`、`AlarmCmd`、`TeleBoot` 与 `PTZCmd` 原样透传；`device.SetControlHandlers` 按命令触发可选宿主回调（仅安装了回调才执行，其余保持显式 control reject）；`platform.PTZController` 新增 `SendIFrameCmd`。2022 收尾控制命令（issue #108）一并落地：`FormatSDCard`（A.2.3.1.13，卡号/0=全部）与 `PTZPreciseCtrl`（A.2.3.1.11 绝对 Pan/Tilt/Zoom）为常规回调；`DeviceUpgrade`（A.2.3.1.12）走 `SetDeviceUpgrader` 接缝（形同抓拍执行器）——宿主下载并刷写固件，库以请求 SessionID 关联 A.2.5.9 `DeviceUpgradeResult` 通知（失败原因码 01/02/03/99）；平台侧新增 `SendDeviceUpgradeCmd`/`SendFormatSDCardCmd`/`SendPTZPreciseCmd`。线格式取值与 gb28181-rs #58 一致，跨孪生 golden 钉板。 订阅（issue #80）也已端到端落地：平台 SUBSCRIBE（Catalog / Alarm / MobilePosition）按事件簿记（续订/过期）并回 200 OK 回显 `Expires`；`device.Server.Notifier()` 向宿主提供 `SendAlarm` / `SendCatalogChange` / `SendMobilePosition`（未订阅时安全 no-op），`SetPositionSource` 按订阅 `Interval` 周期上报位置——NOTIFY 线格式对齐 Rust 孪生（gb28181-rs #66）。 语音对讲接收半边（§9.2）补齐 2022 能力：纯音频 INVITE offer（`m=audio`、无 `m=video`）即对讲会话——设备以临时 UDP 端口应答，剥离 RTP 头后把 G.711 A/μ 律载荷交给 `device.SetTalkbackSink` 安装的宿主 sink（`OnAudio(payload, ssrc, codec)`）；无 sink、非 G.711 编码或 TCP 媒体一律 488 拒绝。移植自生产验证过的 gb28181-rs 参考实现——golden 钉板字节级应答与真实 NVR offer 形态（仅 payload-type 的 PCMA 无 `a=rtpmap`、前导零十进制 `y=` SSRC、无尾部 CRLF）。 PTZCmd 现以位级解码送达（GB/T 28181 §A.3-A.4）：`DecodePTZCommand` 为 platform 侧构造器的逆运算——运动方向位+各轴速度、预置位设置/调用/删除、巡航指令、FI 聚焦/光圈、辅助开关——golden 与 Rust 孪生共享同一字节表；`OnPTZCmd` 接收结构化命令（无法解码的十六进制以 `Kind=PtzInvalid` 原样保留）。 SIP-Date 校时观测（2022 §9.10.2）：解析 REGISTER 应答的 `Date` 头并经 `Server.PlatformDateUnix()` 暴露；漂移超 5 秒记日志——是否校时由宿主决定。 DeviceConfig 以同样姿态落地（§9.3.3 / A.2.3.2，线格式经 2022 标准原文核验）：`SetConfigHandlers` 解码固定相机可执行的子集——`BasicParam`（名称+注册参数）、`FrameMirror`（0-3 翻转模式）、`AlarmReport`（移动侦测/区域入侵上报开关），以及 issue #109 扩充族：`VideoParamAttribute`（逐流编码/分辨率/帧率/码率，A.2.3.2.5）、`VideoRecordPlan`（周录像计划，A.2.3.2.6）、`VideoAlarmRecord`（报警录像含预录/延录，A.2.3.2.7）、`PictureMask`（隐私遮挡区域，A.2.3.2.8）、`OSDConfig`（时间/文字叠加，A.2.3.2.11）——回调执行的命令答 `Result=OK`，其余保持 reject。SVAC 编解码配置（A.2.3.2.3/4）**显式不支持**（与其余 SVAC 面一致）；巡航轨迹**配置**在 2022 标准里不是 DeviceConfig 子命令——走 PTZCmd 巡航指令（A.3.5，已位级解码）；ConfigDownload 查询（A.2.4.7）按请求回最小合规 Response（请求含 BasicParam 时带上运行配置的对应块；请求含 VideoParamOpt 时按 `Config.VideoParamOptDownloadSpeed`/`VideoParamOptResolution` 回 A.2.1.20 下载倍速/分辨率块）。`HomePosition` 并入 DeviceControl 回调（A.2.3.1.10），`platform.PTZController` 新增结构化 `SetHomePosition`。注意：2022 校时不是 DeviceConfig 子命令——§9.10.2 走 REGISTER 应答的 SIP Date 头。
+
+### 多级级联激活接缝（v0.10.0）与 GB28181-2022 对齐
+
+**HubActivator（issue #73，MiBeeNvr #451）**——上级平台点播 hub 空闲的通道（未在录的 GB 子设备相机）时，级联先经 `platform/cascade.Service.SetHubActivator` 注入的激活器拉起主码流，由 `Config.HubActivationTimeout`（默认 10s）限时；拿到真实 hub 才回 200，失败保持原 500、绝不建立无媒体对话。一次激活转发持有一个引用，会话拆除（BYE / supersede / Stop）时释放。未注入激活器时行为与原实现逐字节一致。`Config.RoutePathAnnounce`（可选，20 位平台编码）按附录 H.3 在 INVITE 200 应答上携带 `X-RoutePath` 供多级路径发现；入向 `X-PreferredPath` 会被解析并记录。
+
+**2022 信令增量**（全部可选或仅解析——默认线格式不变）：
+
+- 五组 2022 信息查询进入 `manscdp` 编解码（golden 钉标准原文 A.2.4.10-14 / A.2.6.12-16）：`HomePositionQuery`、`CruiseTrackListQuery`、`CruiseTrackQuery`、`PTZPosition`、`SDCardStatus`。设备角色对它们给出"空能力"的最小合法应答，不再落入旧的未知 CmdType 静默。
+- `X-GB-Ver` 协议版本标识（附录 I）：`device.Config.ProtocolVersion` / `platform/sip.Config.ProtocolVersion`（可选，2022 填 "3.0"）在 REGISTER 及其应答上携带；设备侧经 `Server.PlatformProtocolVersion()` 感知平台版本。
+**多级级联环路防护（issue #77）**——`CameraInfo.OriginDeviceID` 标记通道来自哪个下级设备（空 = 本地相机）。目录聚合按上级维度过滤：来源等于该上级平台编码的通道（上级自己的通道经其下级注册回流）在目录应答、订阅 NOTIFY 与注册推送中一律排除，其 INVITE 按 404 拒绝（与 `CascadeHidden` 一致）；第三方来源不受影响。
+
+- **SVAC 音频 stream_type 修正为 `0x9B`**（附录 C 表；原实现误为 `0x81`，对照标准原文核查时发现的线格式 bug），PS 复用器新增 AAC 音频（`0x0F`）声明。
+
+## GB/T 28181-2011 设备侧兼容
+
+设备角色可与 2011 世代平台互操作。依据 GB/T 28181-2016 前言的官方技术变化清单，2011 平台会行使的信令是 2016/2022 的严格子集——TCP 媒体、语音广播/对讲、IFrameCmd/DragZoom/看守位、DeviceConfig、配置/预置位查询、多 MESSAGE 传输与订阅族全部是 2016 新增；设备角色对它们"来了才处理、未实现显式拒绝"，从不要求。设备发出侧天然 2011 可消费：INVITE 应答 SDP 带 `y=`、不带 `f=`/`a=setup`（2016 扩展），REGISTER 默认不带 `X-GB-Ver`（既有测试钉板）。
+
+本发布修复了一个真实的 2011 互操作缺口：2011 平台按 §9.4.1 以 **GB2312 声明**发出 MANSCDP 报文（Catalog/DeviceInfo 查询尤甚），而设备侧双形式解析器用裸 `encoding/xml`——Go 的 XML 解码器在无 `CharsetReader` 时直接拒析非 UTF-8 声明的文档，查询会被 WARN + 静默丢弃。现统一经共享编解码的 `manscdp.UTF8Body` 归一（字节转码 + 声明剥离）后解析，GB2312/GBK/GB18030 声明在库内全部路由（设备侧与平台侧）可读。2011 形状（GB2312 声明的子元素查询 → 属性形式应答、无 2016 扩展的应答 SDP）由 `device/gb2011_compat_test.go` 钉板。
+
+## 文档
+
+主题手册**就在本仓库内**，双语：
+[`docs/README.md`](docs/README.md) 是索引（`docs/en-US/` 与
+`docs/zh-CN/` 存放各页——快速开始、架构、协议概念、CLI 手册、
+[无硬件联调全链路教程](docs/zh-CN/gb28181-go-interop-lab.md)、
+[GB35114 国密手册](docs/zh-CN/gb28181-go-gb35114.md)、测试）。
+修订与新页以 PR 落本仓。
+## 互操作 CLI
+
+[`cmd/gb28181`](cmd/gb28181) 是单一互操作命令行——一个二进制、三个子
+命令——每个子命令文件同时是对应库半边的可运行集成样例：
+
+| 子命令 | 角色 | 演示 |
+|---|---|---|
+| [`device-register`](cmd/gb28181/device_register.go) | 设备端（UAC） | SIP 注册、保活、目录应答、经 `device.FrameHub` 喂帧、INVITE 拉流 |
+| [`platform-uas`](cmd/gb28181/platform_uas.go) | 平台端（UAS） | 摘要鉴权 SIP 服务器、内存版 `DeviceStore` 接缝、告警 `EventBus` 订阅、INVITE/ByeChannel 流程 |
+| [`psmux-rtp`](cmd/gb28181/psmux_rtp.go) | 媒体链路 | H.264 Annex-B → MPEG-PS → RTP 打包发送到 UDP 接收端 |
+
+全部配置走旗标（旧的预编译示例把配置硬编码在源码里，发布出去的二进制
+根本没法用）：
+
+```sh
+gb28181 device-register -platform 192.168.1.10:5060 -password secret -transport tcp
+gb28181 platform-uas -listen :5060 -password secret
+gb28181 psmux-rtp
+```
+
+[每次发布](https://github.com/mickeyzzc/gb28181-go/releases)都以预编译零
+依赖包提供该 CLI（`gb28181-cli_<os>_<arch>.tar.gz` / `.zip` +
+`SHA256SUMS`，七平台）。逐子命令手册（含场景）见本仓 docs
+（[文档](#文档)）；把三个子命令串成"虚拟相机 + 最小平台 + conformance
+自证"的完整玩法，见**[无硬件联调国标全链路教程](docs/zh-CN/gb28181-go-interop-lab.md)**。
+
+## 开发
+
+本项目严格执行 **TDD**，见 [CONTRIBUTING.md](CONTRIBUTING.md)。CI 强制 `gofmt`、`go vet`、`go test -race`；`main` 分支受保护（仅 PR 合入，CI 必过）。
+
+## 状态
+
+`device/` 与 `manscdp/` 已发布；`platform/` 抽取全部 4 批完成（PS 解复用/复用、注册表、端口池、PTZ、RTP 接收、会话编排、SIP UAS 服务器、级联）。API 面趋于稳定但尚未冻结。在 [Mi-Bee Studio](https://github.com/Mi-Bee-Studio) 每日对 MiBee NVR 国标平台生产验证。
+
+### API 面说明：两套 PS 复用器、两套 MANSCDP 类型
+
+`device.MuxH264ToPS`（经真实平台实战）与 `psmux.New()`（支持 H.265 +
+G.711 音频）有意并存，`device/` 与 `manscdp/` 的 MANSCDP 类型集同理：
+设备侧线上字节与 Rust 孪生库有 golden 逐字节契约，在确定 wire 兼容
+策略前暂缓合并。需要 H.265/音频的新集成选 `psmux`；需要与孪生库字节
+一致时用 `device/` 内置实现。
+
+## 库卫生（v0.3.0 加固）
+
+v0.3.0 移除了线上协议中的产品品牌标识，第三方项目可放心导入。根目录 `hygiene_test.go` 的源码扫描守卫逐条锁定：
+
+- **SIP User-Agent 可配置且默认中性** —— 平台端默认 `gb28181-go`、级联端默认 `gb28181-go/cascade`（原来是写死的 `MiBeeNvr-GB28181/1.0`）。`platform/sip.Config.UserAgent`、`platform/cascade.Config.UserAgent` 可覆盖。
+- **目录/DeviceInfo 身份默认中性** —— 级联目录条目缺省 `Manufacturer`/`Model` 为 `Unknown`（原来是 `MiBee`/`MiBeeNvr`），可用 `CatalogDefaultManufacturer`/`CatalogDefaultModel` 覆盖。
+- **设备端 dialog To-tag 来自 crypto/rand** —— 8 位十六进制，不再带品牌前缀、不再由时间推导（RFC 3261 §19.3）。
+- **平台 logger 跟随 slog.SetDefault** —— 每次调用时从当前默认 logger 派生，宿主随时可重定向（修复了 init 时绑定导致注释与行为不符的问题）。
+- **INVITE 应答超时可配置** —— `platform/sip.Config.InviteResponseTimeout`（默认 32s）。
+- **`device.FormatDeviceID`/`ParseDeviceID`** —— 落实了原空 stub 承诺的 20 位国标编号生成/解析（错误返回 error 而非 panic）。
+- **包注释修正** —— `device` 包 9 个文件的错误 `// Package gb28181` 注释已更正。
+
+## 许可
+
+MIT —— 见 [LICENSE](LICENSE)。

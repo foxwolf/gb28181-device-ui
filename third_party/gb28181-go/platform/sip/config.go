@@ -1,0 +1,218 @@
+package sip
+
+import "time"
+
+// DefaultUserAgent is the SIP User-Agent the platform sends on outbound
+// requests when Config.UserAgent is empty — neutral, never a product name.
+const DefaultUserAgent = "gb28181-go"
+
+// Config configures the GB/T 28181 platform (UAS) server. Field-compatible
+// with MiBeeNvr's config.GB28181ServerConfig — the host maps its own config
+// onto this struct.
+type Config struct {
+	Enabled bool `yaml:"enabled"`
+
+	// SIPListen is the SIP UDP/TCP listen address, e.g. ":5060".
+	SIPListen string `yaml:"sip_listen"`
+
+	// ServerID is the platform GB 20-digit serial (e.g. "34020000002000000001").
+	ServerID string `yaml:"server_id"`
+
+	// Realm is the SIP digest-auth realm presented in REGISTER challenges.
+	Realm string `yaml:"realm"`
+
+	// Password is the SIP digest-auth secret that registered devices must use.
+	Password string `yaml:"password"`
+
+	// ProtocolVersion, when non-empty, is stamped as the X-GB-Ver header on
+	// REGISTER responses (GB/T 28181-2022 Annex I: "3.0"=2022, "2.0"=2016).
+	// Empty (default) omits the header — the peer's REGISTER X-GB-Ver is
+	// still parsed and logged either way.
+	ProtocolVersion string `yaml:"protocol_version"`
+
+	// RegisterFailureLimit is the number of REGISTER authentication
+	// failures (digest or GB35114) from one source host before a temporary
+	// lockout; unset = 5, negative disables the limiter (issue #38).
+	RegisterFailureLimit int `yaml:"register_failure_limit,omitempty"`
+
+	// RegisterFailureWindow is how long failures stay counted. Go duration
+	// string; unset = "60s".
+	RegisterFailureWindow string `yaml:"register_failure_window,omitempty"`
+
+	// RegisterLockoutDuration is how long a locked-out source is refused
+	// (403 without an auth challenge). Unset = "60s".
+	RegisterLockoutDuration string `yaml:"register_lockout_duration,omitempty"`
+
+	// StrictAuth refuses REGISTERs outright when no authentication is
+	// configured (empty Password and no RegisterAuthenticator) — fail
+	// closed instead of silently accepting every device (issue #38).
+	StrictAuth bool `yaml:"strict_auth,omitempty"`
+
+	// RegisterAuthenticator authenticates REGISTERs that carry a non-Digest
+	// Authorization scheme (GB 35114 A-level). When set, such REGISTERs are
+	// routed to it (challenge → verify → SecurityInfo on the 200 OK) and the
+	// Note header of subsequent requests is verified; Digest REGISTERs keep
+	// flowing through Password. The concrete implementation is build-tagged
+	// (security35114.Platform behind -tags gb35114); the field is
+	// assembly-level, not configurable from YAML.
+	RegisterAuthenticator RegisterAuthenticator `yaml:"-"`
+
+	// UserAgent overrides the SIP User-Agent on outbound requests.
+	// Empty = DefaultUserAgent ("gb28181-go"). Some vendor platforms
+	// fingerprint the UA — set this if yours does.
+	UserAgent string `yaml:"user_agent,omitempty"`
+
+	// InviteResponseTimeout bounds how long InviteChannel waits for the
+	// device's answer to a SIP INVITE. Go duration string; default "32s".
+	InviteResponseTimeout string `yaml:"invite_response_timeout,omitempty"`
+
+	// PortRange is the RTP media port pool, "start-end". Default "30000-30050".
+	PortRange string `yaml:"port_range"`
+
+	// AllowedDeviceIDs restricts which devices may register. Empty = allow any.
+	AllowedDeviceIDs []string `yaml:"allowed_device_ids,omitempty"`
+
+	// AllowSameIPEnroll opts GB28181 auto-enroll out of the cross-protocol
+	// dedup: when true, a channel whose device registers from an IP that
+	// already hosts another camera's stream is STILL auto-enrolled as its own
+	// camera. For deliberate dual-protocol setups. Default false.
+	AllowSameIPEnroll bool `yaml:"allow_same_ip_enroll,omitempty"`
+
+	// HeartbeatInterval is how often devices are expected to send Keepalive.
+	HeartbeatInterval string `yaml:"heartbeat_interval"` // default "60s"
+
+	// CatalogInterval is how often the platform refreshes the device catalog.
+	CatalogInterval string `yaml:"catalog_interval"` // default "30m"
+
+	// SubChannelProbe gates the sub-channel prober: "auto" (default),
+	// "on", or "off".
+	SubChannelProbe string `yaml:"sub_channel_probe,omitempty"`
+
+	// SubChannelProbeOffset is the channel-code numeric offset the prober
+	// applies to derive the sub-channel candidate (Hikvision convention: +1).
+	// 0 disables probing regardless of SubChannelProbe. Range 1–99.
+	SubChannelProbeOffset int `yaml:"sub_channel_probe_offset,omitempty"`
+
+	// TCPMode forces TCP media transport (passive).
+	//
+	// Deprecated: superseded by MediaTransport; kept as a YAML-compat no-op.
+	TCPMode bool `yaml:"tcp_mode"`
+
+	// TCPFraming selects the TCP-passive framing: "rfc4571", "0x24", or "auto".
+	TCPFraming string `yaml:"tcp_framing"` // default "auto"
+
+	// MediaTransport selects the RTP media transport for INVITE sessions:
+	// "tcp-passive" (default), "udp", or "tcp-active".
+	MediaTransport string `yaml:"media_transport"`
+
+	// MonitorUserID (optional) stamps a Monitor-User-Identity header on
+	// INVITEs — the GB 35114 third-party call-control marker naming the
+	// user on whose behalf the platform pulls a stream (empty omits it).
+	MonitorUserID string `yaml:"monitor_user_id,omitempty"`
+
+	// SIPTransport selects the SIP signaling listener: "udp" (default),
+	// "tcp" (adds a SIP-over-TCP listener alongside UDP), or "tls" (SIPS —
+	// TLS listener per GB/T 28181-2022 A-level security; outbound requests
+	// to devices then carry ;transport=tls and reuse the connection the
+	// device registered over).
+	SIPTransport string `yaml:"sip_transport"`
+
+	// TLSCertFile / TLSKeyFile are the SIPS server certificate pair
+	// (PEM). Required when SIPTransport is "tls".
+	TLSCertFile string `yaml:"tls_cert_file,omitempty"`
+	TLSKeyFile  string `yaml:"tls_key_file,omitempty"`
+
+	// SubscribeCatalog enables SUBSCRIBE Catalog. Default: on when Enabled.
+	SubscribeCatalog *bool `yaml:"subscribe_catalog,omitempty"`
+
+	// SubscribeAlarm enables SUBSCRIBE Alarm. Default: on when Enabled.
+	SubscribeAlarm *bool `yaml:"subscribe_alarm,omitempty"`
+
+	// SubscribeMobilePosition enables SUBSCRIBE MobilePosition for moving
+	// devices. Default false — stationary cameras never emit reports.
+	SubscribeMobilePosition bool `yaml:"subscribe_mobile_position"`
+
+	// SubscribeExpires is the SUBSCRIBE lifetime; renewed at 80%.
+	SubscribeExpires string `yaml:"subscribe_expires"` // default "3600s"
+
+	// AlarmLinkage configures alarm-triggered streaming: on an alarm
+	// notification, INVITE the alarm channel when it is not already streaming,
+	// hold the stream for the configured duration, then BYE.
+	AlarmLinkage *AlarmLinkageConfig `yaml:"alarm_linkage,omitempty"`
+}
+
+// AlarmLinkageConfig is the alarm→stream linkage block.
+type AlarmLinkageConfig struct {
+	Enabled bool `yaml:"enabled"`
+
+	// Duration of each alarm-triggered stream hold. Default "60s".
+	Duration string `yaml:"duration"`
+}
+
+// AlarmLinkageDuration resolves the hold duration with its default.
+func (c *AlarmLinkageConfig) AlarmLinkageDuration() time.Duration {
+	if c == nil {
+		return 0
+	}
+	if d, err := time.ParseDuration(c.Duration); err == nil && d > 0 {
+		return d
+	}
+	return 60 * time.Second
+}
+
+// CatalogSubscriptionOn resolves the subscribe_catalog toggle: on when the
+// server is enabled and the flag is unset or true.
+func (c Config) CatalogSubscriptionOn() bool {
+	if c.SubscribeCatalog == nil {
+		return c.Enabled
+	}
+	return *c.SubscribeCatalog
+}
+
+// AlarmSubscriptionOn resolves the subscribe_alarm toggle.
+func (c Config) AlarmSubscriptionOn() bool {
+	if c.SubscribeAlarm == nil {
+		return c.Enabled
+	}
+	return *c.SubscribeAlarm
+}
+
+// EffectiveUserAgent resolves the outbound SIP User-Agent (neutral default).
+func (c Config) EffectiveUserAgent() string {
+	if c.UserAgent != "" {
+		return c.UserAgent
+	}
+	return DefaultUserAgent
+}
+
+// InviteTimeout resolves the INVITE answer timeout (default 32s).
+func (c Config) InviteTimeout() time.Duration {
+	if d, err := time.ParseDuration(c.InviteResponseTimeout); err == nil && d > 0 {
+		return d
+	}
+	return 32 * time.Second
+}
+
+// effectiveRegisterFailureLimit resolves the REGISTER failure-lockout
+// budget: unset → 5, explicit 0 → disabled, negative → disabled.
+func (c Config) effectiveRegisterFailureLimit() int {
+	if c.RegisterFailureLimit == 0 {
+		return 5
+	}
+	if c.RegisterFailureLimit < 0 {
+		return 0
+	}
+	return c.RegisterFailureLimit
+}
+
+// effectiveDuration parses a Go duration string, falling back to def when
+// empty or invalid.
+func (c Config) effectiveDuration(v string, def time.Duration) time.Duration {
+	if v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil {
+		return d
+	}
+	return def
+}

@@ -74,7 +74,13 @@ func (s *AnnexBSplitter) feed(n device.NALU) []device.AccessUnit {
 	if isAUD(n.Type) {
 		startNew = true
 	} else if isVCL(n.Type) && s.hasVCL {
-		startNew = true
+		// Same-picture slices (first_mb_in_slice != 0) belong to the current AU.
+		// Starting a new AU on every VCL splits libx264 sliced-threads frames
+		// and leaves each picture incomplete (typical mosaic / concealment).
+		mb, ok := firstMbInSlice(n.Data)
+		if !ok || mb == 0 {
+			startNew = true
+		}
 	}
 	var out []device.AccessUnit
 	if startNew {
@@ -150,6 +156,56 @@ func naluFrom(payload []byte) device.NALU {
 		IsSPS: typ == 7,
 		IsPPS: typ == 8,
 	}
+}
+
+
+// firstMbInSlice reads first_mb_in_slice from a coded-slice NAL (types 1-5).
+// The value is ue(v) immediately after the 1-byte NAL header (baseline / AVC).
+func firstMbInSlice(nal []byte) (uint32, bool) {
+	if len(nal) < 2 {
+		return 0, false
+	}
+	typ := nal[0] & 0x1F
+	if typ < 1 || typ > 5 {
+		return 0, false
+	}
+	return decodeUE(nal[1:])
+}
+
+func decodeUE(buf []byte) (uint32, bool) {
+	zeros, bit := 0, 0
+	for {
+		b, ok := getBit(buf, bit)
+		if !ok {
+			return 0, false
+		}
+		bit++
+		if b == 1 {
+			break
+		}
+		zeros++
+		if zeros > 31 {
+			return 0, false
+		}
+	}
+	val := uint32(0)
+	for i := 0; i < zeros; i++ {
+		b, ok := getBit(buf, bit)
+		if !ok {
+			return 0, false
+		}
+		bit++
+		val = (val << 1) | uint32(b)
+	}
+	return (1 << zeros) - 1 + val, true
+}
+
+func getBit(buf []byte, bit int) (uint32, bool) {
+	i, rem := bit/8, bit%8
+	if i >= len(buf) {
+		return 0, false
+	}
+	return uint32((buf[i] >> (7 - rem)) & 1), true
 }
 
 func isVCL(t byte) bool { return t >= 1 && t <= 5 }
