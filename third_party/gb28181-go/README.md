@@ -1,0 +1,186 @@
+# gb28181-go
+
+**English** | [中文](README.zh-CN.md)
+
+[![CI](https://github.com/mickeyzzc/gb28181-go/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyzzc/gb28181-go/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Language: Go](https://img.shields.io/badge/language-Go-00ADD8.svg)
+![Tests](https://img.shields.io/badge/tests-700%2B%20passing-brightgreen.svg)
+
+GB/T 28181-2011/2016/2022 libraries for Go — device (UAC) and platform (UAS) roles for the Chinese national video-surveillance standard. The device role interoperates with 2011-era platforms (see [GB/T 28181-2011 device-side compatibility](#gbt-28181-2011-device-side-compatibility)).
+
+Hand-written SIP (no SIP framework on the device side; the platform side builds on [ghettovoice/gosip](https://github.com/ghettovoice/gosip)), MANSCDP XML codec, RTP/PS media, and session orchestration. Extracted verbatim from Mi-Bee Studio production code, hardened against real GB28181 platforms (digest qop=auth, unique Via branches, local-IP detection, MANSCDP attribute form, SIP-over-TCP, TCP media).
+
+## Packages
+
+| Package | Role | Origin |
+|---|---|---|
+| `device/` | **UAC** — register a camera with a SIP platform: REGISTER + digest auth, catalog/deviceinfo/keepalive, INVITE-driven RTP/PS live streaming, RecordInfo, paced playback/download with SIP INFO control (the completion INFO rides the dialog's own transport). UDP, TCP (inbound listener or **tcp-out** — the device dials the platform with the full lifecycle), and SIPS (TLS, outbound) — SUBSCRIBE/NOTIFY dialogs, large multi-MESSAGE catalog/record answers and the async snapshot/upgrade notifies ride any of them; dropped stream connections re-dial on the next re-registration cycle. Media distribution: unicast by default; **multicast works both ways** — the platform half joins the IGMP group when the INVITE's media address is one (issue #111 follow-up), and the device half sends to group addresses with a configurable `multicast_ttl`. | `mibee-eye-raspi-go` `internal/gb28181` |
+| `manscdp/` | shared MANSCDP XML codec (element+attribute forms, GB2312/GBK/GB18030/UTF-8) | MiBeeNvr `internal/gb28181/manscdp` |
+| `platform/` | **UAS** (migration batches 1–3/4 landed) — device/channel registry with keepalive liveness, MPEG-PS demux (PSM-less audio fallback heuristic), port pool, PTZ/A505 command building, RTP receive/reassembly (UDP + TCP-passive, jitter buffer, SSRC latch), INVITE/BYE SessionManager with FrameHub fan-out. The 2022 standard's second encapsulation — ES over RTP (issue #110) — is received too: RFC 6184/7798 payloads (single NALU / STAP-A / FU-A, H.265 single / AP / FU) depacketize into the same `[][]byte` AU shape the PS path emits, latched per session, so FrameHub consumers and the AU/NALU callbacks do not change. Multicast receiving works: a group address as the INVITE's media address makes the session join the IGMP group (issue #111 follow-up). Audio-only channels — voice-input devices (Table E.1 type code 136, network pickups) — enroll from the catalog like cameras: the live INVITE negotiates a lone `m=audio` line (G.711 A-law, PT 8) and the receiver takes bare G.711 RTP or PS-muxed audio; the Annex C audio stream-type map is complete (G.711 A/μ, G.722.1, G.723.1, G.729, AAC, SVAC — issue #135). | MiBeeNvr `internal/gb28181` |
+| `platform/sip/` | SIP UAS server on gosip — REGISTER + digest auth (qop=auth), keepalive/offline detection, catalog refresh + SUBSCRIBE (Catalog/Alarm/MobilePosition), INVITE/BYE with firmware-quirk patches (speculative ACK, dialog reset, REGISTER source-port rotation, long-GOP IDR watchdog), playback/talk domains, alarm-triggered stream linkage. Persistence via the `DeviceStore` interface; events via the built-in lossy `EventBus` (`gb28181.alarm`, `gb28181.snapshot.finished`). | MiBeeNvr `internal/gb28181/sip` |
+| `psmux/` | PS/RTP muxer (H.264/H.265, G.711 audio, >60KB AU splitting, RTP fragmentation) shared by device push and platform/cascade forwarding | MiBeeNvr `internal/gb28181/psmux` |
+| `nalutil/` | NALU utilities (IDR detection, parameter-set extraction/comparison) — shared by platform receive and the future device side | MiBeeNvr `internal/model/nalutil` |
+| `conformance/` | device↔platform loopback conformance suite — a real `device.Server` against a real platform SIP server on localhost: REGISTER+digest → catalog → keepalive liveness → INVITE live → byte-exact RTP/PS round-trip → BYE; plus the SIPS (TLS signaling) variant. Both roles must agree on every protocol reading, on every CI run. | new (issue #13) |
+| `platform/cascade/` | Cascade client — this platform registers as a LOWER platform to an upper platform: aggregated catalog upload with stable first-seen channel IDs, INVITE forwarding (FrameHub subscribe → psmux → RTP), playback from recorded segments, BYE/SUBSCRIBE/MESSAGE/INFO/OPTIONS handling, protocol-level loopback tests. Local cameras via `CameraSource`, persistence via `Store`, segment reading via `SegmentParser` — all host-injected. | MiBeeNvr `internal/gb28181/cascade` |
+| `security35114/` | **opt-in, build-tagged (`-tags gb35114`)** — GB 35114-2017 security **levels A/B/C** for **both sides**: device-side SM2-certificate mutual authentication over the REGISTER flow (`device.Config.RegisterAuthenticator`) and platform-side challenge/verify/Note state machine (`security35114.Platform`, wired through `platform/sip`'s `Config.RegisterAuthenticator`). VKEK negotiation inside the `cryptkey` SM2 envelope, keyed-SM3 `Note`-header integrity for subsequent signaling. | new (v0.4.0, platform side v0.5.0) |
+
+## Usage (device)
+
+```go
+import "github.com/mickeyzzc/gb28181-go/device"
+
+cfg := device.Config{
+    PlatformSIPAddress: "192.168.1.10",
+    PlatformSIPPort:    5060,
+    DeviceID:           "34020000001320000001",
+    ChannelID:          "34020000001310000001",
+    SIPDomain:          "3402000000",
+    Password:           "your-platform-password", // digest-auth secret agreed with the platform — never ship a real one in docs or code
+}
+
+srv := device.New(cfg, device.DeviceInfo{Name: "My Cam"}, frameSource)
+// frameSource implements device.FrameSource over your capture hub;
+// optionally srv.SetRecordingIndex(...) for RecordInfo/playback.
+err := srv.Start(ctx)
+```
+
+Host seams (interfaces, host-injected):
+- `FrameSource` — live H.264 access units
+- `RecordingSource` — recorded-segment index for RecordInfo/playback
+- `Config` / `DeviceInfo` — settings and identity (YAML shapes unchanged from the source projects)
+
+Segment files use the reference format read by `device.OpenSegment`: bare Annex-B H.264 + per-frame `.ts.jsonl` sidecar. A ready-made `device.FrameHub` implements `FrameSource` with bounded-channel, drop-on-full semantics for tests.
+
+## GB35114 security, levels A/B/C (opt-in)
+
+[GB 35114-2017](https://openstd.samr.gov.cn/bzgk/std/newGbInfo?hcno=B7F5589329EF98B32F0EB8ACEC341C81) layers SM2-certificate security on top of GB/T 28181 — **levels A/B/C are all implemented** (the B/C media side in the PS-over-RTP software form: per-AU SM2 signatures at B, SM4-OFB payload encryption under a VKEK-sealed VEK at C, negotiated per session over the INVITE SDP `a=security` attribute; every media direction covered — live, playback/download, talk both ways, voice broadcast, cascade). SVAC-native (GB/T 25724 hardware-codec) streams remain out of scope by design. The package lives behind the `gb35114` build tag so default builds stay dependency-light. Deep-dive manual (handshake wire format, wiring for both roles, levels B/C media security, key management, certificate provisioning): **[the GB35114 manual](docs/en-US/gb28181-go-gb35114.md)**.
+
+```go
+// go build -tags gb35114
+import sec "github.com/mickeyzzc/gb28181-go/security35114"
+
+auth, err := sec.New(sec.Options{
+    Device:       devIdentity,     // sec.LoadIdentityFromFiles(cert, key)
+    PlatformCert: platCert,        // sec.LoadCertificate(cert) — verifies sign2
+    DeviceID:     "34020000001320000001",
+    ServerID:     "34020000002000000001",
+})
+cfg.RegisterAuthenticator = auth   // replaces Digest auth in the REGISTER lifecycle
+```
+
+The handshake follows the published standard text cross-checked against real captures: `Capability` announcement → 401 with `random1` → signed re-REGISTER (`sign1` = SM2 over random2‖random1‖serverID) → 200 OK `SecurityInfo` carrying the SM2-sealed VKEK (`cryptkey`, DER C1‖C3‖C2 envelope) and, for `Bidirection`, the platform's `sign2`. After registration every outgoing request (keepalive, …) carries `Date` + `Note: Digest nonce="…",algorithm=SM3` keyed by the VKEK. Golden wire strings pin each header; an end-to-end test drives a real `device.Server` against a fake platform that verifies `sign1`, unseals the VKEK, and validates the first keepalive's `Note`.
+
+Two points are ambiguous across implementations and therefore configurable (`RandomEncoding`, `Sign2Order`): the random representation inside the signed payload, and the R1/R2 operand order of `sign2`. Defaults match the standard text (wire-strings concatenation observed in captures; R1-first). SM3/SM2 come from [emmansun/gmsm](https://github.com/emmansun/gmsm) (pure Go, GM/T 0015-2012 SM2 X.509 certificates).
+
+Wire-format caveats: certificate provisioning is out of band (or `Options.IncludeDeviceCert` for platforms that accept the `cnonce` announcement). Downstream `Note` verification (v0.7.0): after the handshake, platform→device requests carrying a `Note` are verified on the device side against the VKEK with a ±5-minute `Date` freshness window — a bad signature draws 403 by default (`device.Config.IncomingNotePolicy`, with `Warn`/`Off` for rollout), and `Note`-less requests keep passing (mixed-mode Digest platforms).
+
+### Platform side (UAS, v0.5.0)
+
+`security35114.Platform` is the mirror-image state machine for GB/T 28181 platforms: it issues `Bidirection`/`Unidirection` challenges, verifies device `sign1` against the (pre-provisioned or `cnonce`-announced) certificate, seals the VKEK, signs `sign2`, and verifies every subsequent `Note`. `platform/sip.Server` routes non-Digest REGISTER schemes to it and attaches the `SecurityInfo` header to the 200 OK — Digest devices keep flowing through `Password` unchanged:
+
+```go
+// go build -tags gb35114
+plat35114, err := sec.NewPlatform(sec.PlatformConfig{
+    ServerID:    "34020000002000000001",
+    Identity:    platIdentity, // platform SM2 signing cert+key — sign2
+    DeviceCerts: map[string]*smx509.Certificate{deviceID: devCert}, // or trust the cnonce announcement
+})
+sipCfg.RegisterAuthenticator = plat35114 // platform/sip.Config; digest path untouched
+```
+
+`Platform` is safe for concurrent use, keys sessions by device ID, keeps the previous VKEK verifying while a device re-registers, answers SIP-over-UDP retransmissions of the completed REGISTER idempotently, and rejects stale `random1` (replay), scheme mismatches, and unknown/mismatched device certificates with sentinel errors (`ErrChallengeMismatch`, `ErrDeviceCert`, …) that map onto 4xx responses. An in-process loopback test drives a real `device.Server` with the device-side authenticator against a real `platform/sip.Server` with `Platform` wired in — handshake, VKEK agreement, and `Note` verification all under real SM2/SM3.
+
+### GB28181-2022 snapshot & manual recording (issue #49)
+
+The 2022 image-snapshot command rides the device-config channel (issue #107: a `Control` root with `CmdType=DeviceConfig` carrying `SnapShotConfig` — `SnapNum`/`Interval`/`UploadURL`/`SessionID` per A.2.1.24, matching real 2022 platform captures), `manscdp.Decode` parses the `UploadSnapShotFinished` completion notify (A.2.5.7, `SnapShotList` of `SnapShotFileID`), and `platform.PTZController` grows `SendSnapShotCmd` / `StartManualRecord` / `StopManualRecord`. A playback/download session that completes naturally now sends the in-dialog §9.4.2 `MediaStatus: Play Finished` / `Download Finished` SIP INFO (MANSRTSP-style body, byte-compatible with the Rust twin) so platforms stop the fetch immediately; BYE-side teardown stays silent. The §9.3.2 management controls land end-to-end (issue #81): `DeviceControl` decodes `IFrameCmd` (force IDR — platforms send it when starting a pull or after loss), `RecordCmd`, `GuardCmd`, `AlarmCmd`, `TeleBoot` and raw `PTZCmd` passthrough, `device.SetControlHandlers` fires optional per-command host callbacks (installed-callback-only execution; anything else keeps the explicit control reject), and `platform.PTZController` grows `SendIFrameCmd`. The 2022 closure controls (issue #108) join them: `FormatSDCard` (A.2.3.1.13, card number / 0 = all) and `PTZPreciseCtrl` (A.2.3.1.11 absolute Pan/Tilt/Zoom) as regular callbacks, and `DeviceUpgrade` (A.2.3.1.12) behind a `SetDeviceUpgrader` seam shaped like the snapshot executor — the host downloads and flashes, the library correlates the A.2.5.9 `DeviceUpgradeResult` notify with the request's SessionID (reason codes 01/02/03/99); `SendDeviceUpgradeCmd`/`SendFormatSDCardCmd`/`SendPTZPreciseCmd` land on the platform side. Wire values mirror gb28181-rs #58; cross-twin goldens pin them. Subscriptions (issue #80) landed end-to-end too: platform SUBSCRIBEs (Catalog / Alarm / MobilePosition) are booked with renewal/expiry and answered 200 OK echoing `Expires`; `device.Server.Notifier()` hands the host `SendAlarm` / `SendCatalogChange` / `SendMobilePosition` (no-ops until subscribed) and `SetPositionSource` drives periodic position reports on the SUBSCRIBE `Interval` — NOTIFY wire shapes mirror the Rust twin (gb28181-rs #66). Voice talkback receive (§9.2) completes the 2022 story: an audio-only INVITE offer (`m=audio`, no `m=video`) opens a talkback session — the device answers with an ephemeral UDP port, strips the RTP header, and feeds G.711 A/μ-law payload to the host sink installed via `device.SetTalkbackSink` (`OnAudio(payload, ssrc, codec)`); no sink, non-G.711 codec, or TCP media is refused with 488. Ported from the production-verified gb28181-rs reference — goldens pin the byte-exact answer and the real NVR offer form (payload-type-only PCMA without `a=rtpmap`, leading-zero decimal `y=` SSRC, no trailing CRLF). PTZCmd now arrives bit-level decoded (GB/T 28181 §A.3-A.4): `DecodePTZCommand` inverts the platform-side builders — movement direction bits + per-axis speeds, preset set/call/delete, cruise instructions, FI focus/iris, auxiliary switches — with byte-exact goldens shared with the Rust twin; `OnPTZCmd` receives the structured command (undecodable hex is preserved as `Kind=PtzInvalid`). SIP-Date time sync observation (2022 §9.10.2): the REGISTER response's `Date` header is parsed (RFC 3261 §25.1 forms) and exposed via `Server.PlatformDateUnix()`; drift beyond 5s is logged — applying the clock stays with the host. DeviceConfig lands with the same stance (§9.3.3 / A.2.3.2, wire forms verified against the 2022 standard text): `SetConfigHandlers` decodes the subset a fixed camera acts on — `BasicParam` (name + registration tuning), `FrameMirror` (0-3 flip modes), `AlarmReport` (motion/field report switches), plus the issue-#109 family: `VideoParamAttribute` (per-stream codec/resolution/framerate/bitrate, A.2.3.2.5), `VideoRecordPlan` (weekly schedule, A.2.3.2.6), `VideoAlarmRecord` (alarm recording with pre/post roll, A.2.3.2.7), `PictureMask` (privacy-mask regions, A.2.3.2.8) and `OSDConfig` (time/text overlay, A.2.3.2.11) — a callback-executed command answers `Result=OK`, the rest keep the reject. SVAC encode/decode configs (A.2.3.2.3/4) are **explicitly not supported** (same stance as the rest of the SVAC surface); cruise-track *configuration* is not a DeviceConfig command in the 2022 text — it rides the PTZCmd cruise instructions (A.3.5, already bit-level decoded); ConfigDownload queries (A.2.4.7) answer the minimal valid Response with the `BasicParam` block from the live config and the `VideoParamOpt` block (A.2.1.20 download speeds / resolutions, from `Config.VideoParamOptDownloadSpeed`/`VideoParamOptResolution`) when requested. `HomePosition` joins the DeviceControl callbacks (A.2.3.1.10) and `platform.PTZController` gains a struct-form `SetHomePosition`. Note: 2022 校时 is NOT a DeviceConfig sub-command — §9.10.2 does it via the REGISTER response's SIP Date header.
+
+### Multi-level cascade activation seam (v0.10.0) & GB28181-2022 alignment
+
+**HubActivator (issue #73, MiBeeNvr #451)** — the upper platform's INVITE for a channel whose hub is idle (a GB child camera not currently recording) now asks the host to start the pull through the `platform/cascade.Service.SetHubActivator` seam, bounded by `Config.HubActivationTimeout` (default 10s), answering 200 only once a real hub exists; a failed activation keeps the legacy 500 and never establishes a medialess dialog. One activated forward holds one reference, released at session teardown (BYE / supersede / Stop). Without an activator the behavior is byte-identical. `Config.RoutePathAnnounce` (optional 20-digit platform ID) stamps `X-RoutePath` on INVITE 200 responses per Annex H.3 for multi-level path discovery; incoming `X-PreferredPath` is parsed and logged.
+
+**2022 signaling additions** (all opt-in or parse-only — the default wire form is unchanged):
+
+- The five 2022 information queries ride `manscdp` codecs with golden tests pinned to the standard text (A.2.4.10-14 / A.2.6.12-16): `HomePositionQuery`, `CruiseTrackListQuery`, `CruiseTrackQuery`, `PTZPosition`, `SDCardStatus`. The device role answers them with the minimal valid empty-capability responses instead of the legacy unknown-CmdType silence.
+- `X-GB-Ver` protocol-version identification (Annex I): `device.Config.ProtocolVersion` / `platform/sip.Config.ProtocolVersion` (opt-in, e.g. "3.0" for 2022) stamp the header on REGISTER and its responses; the device exposes the platform's version via `Server.PlatformProtocolVersion()`.
+**Multi-level loop prevention (issue #77)** — `CameraInfo.OriginDeviceID` names the downstream device a channel was learned from (empty = local camera). Catalog aggregation is per-upper: channels whose origin equals the requesting upper's platform ID — that upper's own channels echoing back through its downstream registration — are excluded from catalog answers, subscription NOTIFYs and registration pushes, and their INVITEs are answered 404 (same as `CascadeHidden`). Third-party origins keep flowing to every upper.
+
+- **SVAC-audio stream_type corrected to `0x9B`** (Annex C table; was `0x81`, a wire bug found by diffing the implementation against the standard text) and AAC audio (`0x0F`) is now settable on the PS muxer.
+
+## GB/T 28181-2011 device-side compatibility
+
+The device role interoperates with 2011-era platforms. Per the GB/T 28181-2016 foreword's official change list, everything a 2011 platform exercises is a strict subset of what this device answers — TCP media, voice broadcast/intercom, IFrameCmd/DragZoom/HomePosition, DeviceConfig, config/preset queries, multi-MESSAGE transport and the subscription families are all 2016 additions; the device handles them when they arrive (explicit rejects where unhandled) and never requires them. What the device emits is 2011-consumable as-is: the INVITE answer SDP carries `y=` and no `f=`/`a=setup` (2016 extensions), and REGISTER carries no `X-GB-Ver` by default (pinned by an existing test).
+
+This release fixes a real 2011 interop gap found while pinning those shapes: 2011 platforms declare their MANSCDP bodies **GB2312** (§9.4.1 — Catalog/DeviceInfo queries especially), and the device-side dual-form parsers fed them to raw `encoding/xml`, which refuses a non-UTF-8 declaration without a `CharsetReader` — the query drew a WARN and was silently dropped. All parsing routes now normalize through the shared codec's `manscdp.UTF8Body` (byte transcoding + declaration strip), so GB2312/GBK/GB18030 declarations read on every route of both roles. The 2011 shapes (GB2312-declared child-element queries → attribute-form answers, extension-free answer SDP) are pinned by `device/gb2011_compat_test.go`.
+
+## Documentation
+
+Topic guides live **in this repository**, bilingual:
+[`docs/README.md`](docs/README.md) is the index (`docs/en-US/` and
+`docs/zh-CN/` hold the pages — quickstart, architecture, protocol
+concepts, CLI manuals, the [no-hardware full-chain lab](docs/en-US/gb28181-go-interop-lab.md),
+the [GB35114 SM-crypto manual](docs/en-US/gb28181-go-gb35114.md), testing).
+Fixes and new pages land
+here by PR.
+## Interop CLI
+
+[`cmd/gb28181`](cmd/gb28181) is a single interop CLI — one binary,
+three subcommands — and each subcommand file doubles as the runnable
+integration sample for its half of the library:
+
+| Subcommand | Role | Shows |
+|---|---|---|
+| [`device-register`](cmd/gb28181/device_register.go) | Device (UAC) | SIP registration, keepalive, catalog answers, synthetic frames through `device.FrameHub`, INVITE-driven streaming |
+| [`platform-uas`](cmd/gb28181/platform_uas.go) | Platform (UAS) | SIP server with digest auth, in-memory `DeviceStore` seam, alarm `EventBus` subscription, INVITE/ByeChannel flow |
+| [`psmux-rtp`](cmd/gb28181/psmux_rtp.go) | Media path | H.264 Annex-B → MPEG-PS → RTP packetization to a UDP receiver |
+
+Everything is flag-driven (the old prebuilt examples hardcoded their
+configuration, which made the shipped binaries unusable):
+
+```sh
+gb28181 device-register -platform 192.168.1.10:5060 -password secret -transport tcp
+gb28181 platform-uas -listen :5060 -password secret
+gb28181 psmux-rtp
+```
+
+Every [release](https://github.com/mickeyzzc/gb28181-go/releases)
+ships the CLI as a prebuilt, zero-dependency bundle
+(`gb28181-cli_<os>_<arch>.tar.gz` / `.zip` + `SHA256SUMS`, seven
+platforms). Per-subcommand manuals with scenarios live in this repository's
+docs ([Documentation](#documentation)); chaining the three subcommands
+into "virtual camera + minimal platform + conformance self-attestation"
+is written up as **[the full-chain, no-hardware lab](docs/en-US/gb28181-go-interop-lab.md)**.
+
+## Development
+
+This project follows strict **TDD** — see [CONTRIBUTING.md](CONTRIBUTING.md). CI enforces `gofmt`, `go vet`, and `go test -race`; `main` is protected (PR-only merges, CI required).
+
+## Status
+
+`device/` + `manscdp/` shipped; `platform/` extraction complete (4/4 batches: PS demux/mux, registry, portmanager, PTZ, RTP receiver, SessionManager, SIP UAS server, cascade). API surfaces are settling but not frozen. Production-tested daily at [Mi-Bee Studio](https://github.com/Mi-Bee-Studio) against the MiBee NVR GB28181 platform.
+
+### API surface note: two PS muxers, two MANSCDP type sets
+
+`device.MuxH264ToPS` (battle-tested against real platforms) and `psmux.New()`
+(H.265 + G.711 audio capable) intentionally coexist, as do the `device/` and
+`manscdp/` MANSCDP type sets: the device-side wire bytes are golden-tested
+byte-exact against the Rust twin, so consolidation is deferred until a
+wire-compat strategy exists. Pick `psmux` for new integrations needing
+H.265/audio; use the `device/` built-ins when matching the twin's bytes
+matters.
+
+## Library hygiene (v0.3.0 hardening)
+
+v0.3.0 removed product branding from the wire protocol so third parties can import this library as-is. The source-scan guard at the repo root (`hygiene_test.go`) pins each guarantee:
+
+- **Configurable, neutral SIP User-Agent** — platform defaults to `gb28181-go`, cascade to `gb28181-go/cascade` (was hardcoded `MiBeeNvr-GB28181/1.0`). Override via `platform/sip.Config.UserAgent` / `platform/cascade.Config.UserAgent`.
+- **Neutral catalog/DeviceInfo identity** — cascade catalog items default `Manufacturer`/`Model` to `Unknown` (was `MiBee`/`MiBeeNvr`), overridable via `CatalogDefaultManufacturer`/`CatalogDefaultModel`.
+- **Device dialog To-tag from crypto/rand** — 8 hex chars, no product prefix, not time-derived (RFC 3261 §19.3).
+- **Platform logger follows slog.SetDefault** — derived from the current default logger on every call, so hosts can retarget at any time (the init-time binding mismatch is fixed).
+- **INVITE answer timeout is configurable** — `platform/sip.Config.InviteResponseTimeout` (default 32s).
+- **`device.FormatDeviceID`/`ParseDeviceID`** — the previously empty stub now implements 20-digit GB ID formatting/parsing (errors returned, never panicked).
+- **Package comments fixed** — the 9 wrong `// Package gb28181` comments in `device/` are corrected.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

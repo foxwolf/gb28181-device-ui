@@ -5,6 +5,7 @@ go 1.26
 require (
 	gioui.org v0.10.3
 	github.com/mickeyzzc/gb28181-go v0.0.0
+	golang.org/x/image v0.26.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/text v0.41.0
 )
@@ -16,8 +17,7 @@ require (
 	github.com/pion/randutil v0.1.0 // indirect
 	github.com/pion/rtp v1.10.2 // indirect
 	golang.org/x/exp/shiny v0.0.0-20250408133849-7e4ce0ab07d0 // indirect
-	golang.org/x/image v0.26.0 // indirect
 	golang.org/x/net v0.48.0 // indirect
 )
 
-replace github.com/mickeyzzc/gb28181-go => ../gb28181-go
+replace github.com/mickeyzzc/gb28181-go => ./third_party/gb28181-go

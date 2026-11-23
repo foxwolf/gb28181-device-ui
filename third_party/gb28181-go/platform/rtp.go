@@ -1,0 +1,1047 @@
+package platform
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/mickeyzzc/gb28181-go/nalutil"
+	"github.com/pion/rtp"
+)
+
+// TCPMode specifies the framing for TCP transport.
+type TCPMode string
+
+const (
+	TCPModeAuto    TCPMode = "auto"    // Auto-detect from first bytes
+	TCPModeRFC4571 TCPMode = "rfc4571" // 2-byte length prefix (RFC 4571)
+	TCPMode0x24    TCPMode = "0x24"    // 0x24 + 2-byte length (GB28181 standard)
+)
+
+// rtpReadBufSize is the UDP read buffer size. UDP datagrams can be up to
+// 65507 bytes after IP fragmentation reassembly — GB28181 devices commonly
+// emit 1400–4KB PS packets, and Go's UDP Read silently truncates anything
+// larger than the buffer, so a small "MTU-sized" buffer corrupts AUs.
+const rtpReadBufSize = 65535
+
+// Receiver manages GB/T 28181 RTP media reception.
+// It implements Stage 1 of the two-stage pipeline: RTP packet reassembly
+// into complete MPEG-PS access units. Stage 2 is PSDemuxer (psdemux.go).
+//
+// UDP mode: Binds to a UDP port from PortManager.
+// TCP passive mode: Accepts TCP connections with RFC 4571 or 0x24 framing.
+type Receiver struct {
+	cameraID    string
+	hub         *FrameHub
+	portManager *PortManager
+	tcpMode     TCPMode
+
+	// Network connection
+	conn    net.Conn // UDP: *net.UDPConn, TCP: *net.TCPConn
+	isTCP   atomic.Bool
+	done    chan struct{}
+	running atomic.Bool
+
+	// Stage 1: RTP reassembly
+	jitterBuffer     map[uint16]*rtp.Packet // keyed by RTP sequence number
+	jitterBufferMu   sync.Mutex
+	lastSeq          uint16
+	baseSeq          uint16
+	baseSeqSet       bool
+	maxJitterPackets int    // default: 32
+	packetsDroppedU  uint64 // count of gap-skipped packets (diagnostics)
+
+	// GB35114 B/C media security (nil = plaintext session). payloadDecryptor
+	// un-XORs each incoming payload (level C); auVerifier
+	// checks the level-B per-AU signature carried in the marker packet's
+	// RTP header extension and drops the AU on failure (fail closed).
+	// Both are armed concurrently with the running packet loop (a
+	// playback fetch arms its receiver from the INVITE answer, after
+	// Start) — hence the atomics.
+	payloadDecryptor atomic.Pointer[RTPCryptor]
+	auVerifier       atomic.Pointer[auVerifierFn]
+	auVerifyFailed   atomic.Uint64
+	onAUVerifyFailed func()
+
+	// Stage 2: PS demux — or ES depacketization when the session's
+	// payloads are bare NAL units (GB/T 28181-2022 ES over RTP, issue
+	// #110). The mode latches on the first classified payload.
+	demuxer    *PSDemuxer
+	es         *ESDemuxer
+	esLatch    atomic.Bool
+	classified atomic.Bool // payload mode decided once per session
+	// expectDecryptor holds emissions until the level-C decryptor arms:
+	// the INVITE offer promised GB35114-C, so pre-arm packets are
+	// ciphertext — buffering them without draining keeps the stream
+	// complete; arming retro-decrypts and releases the run.
+	expectDecryptor atomic.Bool
+	// audioOnlyHint arms bare-audio mode for voice-input channels (#135):
+	// the first payload that is neither PS nor NAL-shaped is treated as
+	// bare G.711 (PT 8) instead of garbage PS.
+	audioOnlyHint atomic.Bool
+	bareAudio     atomic.Bool
+
+	// OnFirstRTP fires once when the first RTP packet is received — used by
+	// the session layer to confirm a dialog without a matched SIP response
+	// (some device firmwares answer INVITE 200 OK without a Via header, which
+	// no SIP stack can transaction-match).
+	OnFirstRTP func()
+
+	// Callbacks
+	// AUCallback is invoked once per complete access unit (full NALU list).
+	// Preferred by recorders: it preserves AU grouping for muxing and hub
+	// fan-out. Non-blocking.
+	AUCallback func(au [][]byte, ptsTicks int64, isIDR bool)
+
+	// AudioCallback is invoked for each demuxed audio frame (G.711/AAC) from
+	// the PS stream. Non-blocking.
+	AudioCallback func(frame AudioFrame)
+
+	// NALUCallback is invoked for each NALU extracted from PS demux.
+	// Kept for per-NALU consumers; when both are set, AUCallback is used.
+	NALUCallback func(nalu []byte, ptsTicks int64, isIDR bool)
+
+	// Metrics
+	rtpPacketsReceived atomic.Int64
+	rtpPacketsDropped  atomic.Int64
+	auEmitted          atomic.Int64
+	ptsClock           atomic.Int64 // last emitted PTS (90kHz)
+	lastIDRUnix        atomic.Int64 // last IDR AU time (unix nano)
+	lastPktUnix        atomic.Int64 // last received RTP packet time (unix nano)
+	// Emission observability (#142 follow-up): produced-output counters and
+	// the last-production clock. audioEmitted counts demuxed audio frames
+	// from BOTH the bare-G.711 and the PS paths (au_emitted above only ever
+	// counted the PS/ES AU path — a bare-audio session legitimately read 0,
+	// which misdirected field forensics). lastEmissionUnix is seeded by the
+	// first packet so a session that never produces anything is
+	// stall-detectable, not invisible.
+	audioEmitted     atomic.Int64
+	lastEmissionUnix atomic.Int64
+
+	// Payload classification ("ps" | "es" | "bare-audio"), decided once per
+	// session from the first drained payload; "" until then.
+	classification atomic.Value
+
+	// SSRC isolation: the first received packet's SSRC is latched as this
+	// dialog's source; packets from any other SSRC are dropped. A recycled
+	// UDP port can receive stale RTP from a previous dialog's sender (a
+	// forwarder that never saw the BYE, or packets in flight during
+	// teardown) — interleaving those into this session's byte stream
+	// corrupts the PS demuxer and the downstream recorder.
+	ssrcLatched   atomic.Bool
+	expectedSSRC  atomic.Uint32
+	foreignDrops  atomic.Int64
+	foreignLogged atomic.Bool // one warning per session (not per packet)
+}
+
+// NewReceiver creates a new GB28181 RTP receiver.
+func NewReceiver(cameraID string, hub *FrameHub, portManager *PortManager) *Receiver {
+	return &Receiver{
+		cameraID:         cameraID,
+		hub:              hub,
+		portManager:      portManager,
+		tcpMode:          TCPModeAuto,
+		done:             make(chan struct{}),
+		jitterBuffer:     make(map[uint16]*rtp.Packet),
+		maxJitterPackets: 32,
+		demuxer:          NewPSDemuxer(),
+	}
+}
+
+// SetTCPMode sets the TCP framing mode for TCP-passive transport.
+// Ignored in UDP mode.
+func (r *Receiver) SetTCPMode(mode TCPMode) {
+	r.tcpMode = mode
+}
+
+// SetAudioCodecHint seeds the PS demuxer's no-PSM audio fallback with the
+// codec declared in the device's INVITE answer SDP. No-op once the stream's
+// PSM declares the audio codec itself.
+func (r *Receiver) SetAudioCodecHint(codec string) {
+	r.demuxer.SetAudioCodecHint(codec)
+}
+
+// Start begins receiving RTP packets.
+// UDP mode: Binds to an available UDP port from PortManager.
+// TCP mode: Accepts an incoming TCP connection (conn must be non-nil).
+func (r *Receiver) Start(ctx context.Context, conn net.Conn) error {
+	if r.running.Load() {
+		return fmt.Errorf("gb28181: receiver for camera %q already running", r.cameraID)
+	}
+
+	if conn == nil {
+		return fmt.Errorf("gb28181: connection is nil for camera %q", r.cameraID)
+	}
+
+	r.conn = conn
+
+	// Detect TCP mode
+	if _, ok := conn.(*net.TCPConn); ok {
+		r.isTCP.Store(true)
+		logger().Info("gb28181: receiver started in TCP-passive mode",
+			"camera_id", r.cameraID, "tcp_mode", r.tcpMode, "remote", conn.RemoteAddr())
+	} else {
+		r.isTCP.Store(false)
+		logger().Info("gb28181: receiver started in UDP mode",
+			"camera_id", r.cameraID, "local", conn.LocalAddr(), "remote", conn.RemoteAddr())
+	}
+
+	r.running.Store(true)
+	go r.readLoop(ctx)
+	return nil
+}
+
+// Stop terminates the receiver and closes the connection. Port recycling is
+// the SessionManager's job (it owns the port allocation).
+func (r *Receiver) Stop() error {
+	if !r.running.Swap(false) {
+		return nil
+	}
+
+	if r.conn != nil {
+		_ = r.conn.Close()
+	}
+
+	if p := r.payloadDecryptor.Load(); p != nil {
+		(*p).Zero()
+		r.payloadDecryptor.Store(nil)
+	}
+	r.auVerifier.Store(nil)
+
+	if r.done != nil {
+		close(r.done)
+	}
+
+	logger().Info("gb28181: receiver stopped",
+		"camera_id", r.cameraID,
+		"packets_received", r.rtpPacketsReceived.Load(),
+		"packets_dropped", r.rtpPacketsDropped.Load(),
+		"gap_skipped_packets", r.gapSkippedPackets(),
+		"foreign_ssrc_dropped", r.foreignDrops.Load(),
+		"au_emitted", r.auEmitted.Load(),
+		"audio_frames_emitted", r.audioEmitted.Load(),
+		"classification", r.Classification())
+	return nil
+}
+
+// gapSkippedPackets returns the count of packets lost in transit (sequence
+// gaps the jitter drain had to skip). Guarded by jitterBufferMu — the only
+// writer increments under the same lock.
+func (r *Receiver) gapSkippedPackets() uint64 {
+	r.jitterBufferMu.Lock()
+	defer r.jitterBufferMu.Unlock()
+	return r.packetsDroppedU
+}
+
+// Running returns whether the receiver is active.
+func (r *Receiver) Running() bool {
+	return r.running.Load()
+}
+
+// HasReceivedRTP reports whether at least one RTP packet arrived.
+// SetAudioOnly arms bare-audio expectations for voice-input channels
+// (Table E.1 type 136, issue #135): payloads that are neither PS nor
+// NAL-shaped classify as bare G.711 RTP. Call before the first packet.
+func (r *Receiver) SetAudioOnly(v bool) { r.audioOnlyHint.Store(v) }
+
+// RTPExtAUSignature is the RFC 8285 extension ID carrying the GB35114
+// level-B per-AU SM2 signature on the AU's marker packet.
+const RTPExtAUSignature = 1
+
+// errAUSignatureMissing marks a marker AU that carried no level-B signature.
+var errAUSignatureMissing = errors.New("AU signature extension missing")
+
+// RTPCryptor applies the GB35114 level-C per-packet payload protection
+// (SM4-OFB); Zero wipes key material at session end. Structurally identical
+// to device.RTPCryptor and security35114.PacketCryptor satisfies both.
+type RTPCryptor interface {
+	Crypt(payload []byte, ssrc uint32, seq uint16) []byte
+	Zero()
+}
+
+// auVerifierFn is the level-B per-AU signature verifier signature.
+type auVerifierFn func(au []byte, ssrc, timestamp uint32, sig []byte) error
+
+// SetExpectPayloadDecryptor declares that this session's INVITE offered
+// GB35114-C media security: packets arriving before the decryptor arms
+// are buffered without draining (they are ciphertext); the arming call
+// retro-decrypts and releases them. false releases the hold (answer
+// downgrade / teardown).
+func (r *Receiver) SetExpectPayloadDecryptor(expect bool) {
+	r.expectDecryptor.Store(expect)
+}
+
+// SetPayloadDecryptor arms level-C SM4-OFB payload decryption. Ideally
+// called before Start; a late arming (the INVITE answer racing the
+// device's first packets — the device streams the instant it answers) is
+// handled: anything buffered so far is UNDECRYPTED ciphertext, and the
+// one-shot classification latch may already have misread it (encrypted
+// bytes false-positive as ES ~1/3 of the time, latching the whole
+// session into the wrong demuxer). Late arming drops the buffered
+// pre-arm packets and re-opens classification. nil clears the hook
+// without touching session state.
+func (r *Receiver) SetPayloadDecryptor(c RTPCryptor) {
+	r.payloadDecryptor.Store(&c)
+	if c == nil {
+		return
+	}
+	r.jitterBufferMu.Lock()
+	defer r.jitterBufferMu.Unlock()
+	held := r.expectDecryptor.Swap(false)
+	if !held && !r.classified.Load() && len(r.jitterBuffer) == 0 {
+		return // armed before any packet — nothing to salvage
+	}
+	// Late arming (the INVITE answer racing the device's first packets —
+	// the device streams the instant it answers, and the platform's
+	// OpenVEK arming runs SM2/SM4 after the answer transit). The buffered
+	// packets are UNDECRYPTED ciphertext, and the one-shot classification
+	// latch may already have misread them (encrypted bytes false-positive
+	// as ES ~1/3 of the time). Per-packet IVs (SM3(VEK‖SSRC‖seq)) make
+	// the transform position-independent: RETRO-DECRYPT the buffered run
+	// instead of dropping it — nothing is lost, the stream stays complete
+	// from its first packet.
+	for seq, pkt := range r.jitterBuffer {
+		if len(pkt.Payload) > 0 {
+			pkt.Payload = c.Crypt(pkt.Payload, pkt.Header.SSRC, pkt.Header.SequenceNumber)
+			r.jitterBuffer[seq] = pkt
+		}
+	}
+	// Classification and the demuxer may have consumed ciphertext —
+	// re-open both; the (now plaintext) buffered run re-classifies on its
+	// next drain. baseSeq/baseSeqSet stay: the sequence stream itself is
+	// intact.
+	if r.esLatch.Load() || r.bareAudio.Load() {
+		logger().Info("gb28181: GB35114 decryptor armed after classification — retro-decrypting buffered packets and re-classifying",
+			"camera_id", r.cameraID, "buffered", len(r.jitterBuffer))
+	}
+	r.classified.Store(false)
+	r.esLatch.Store(false)
+	r.bareAudio.Store(false)
+	r.es = nil
+	r.demuxer = NewPSDemuxer()
+	// Release the held run (retro-decrypted above) — classification and
+	// AU emission proceed from the stream's true first packet.
+	r.emitAccessUnitsLocked()
+}
+
+// SetAUVerifier arms level-B per-AU signature verification (nil disables).
+func (r *Receiver) SetAUVerifier(fn auVerifierFn) {
+	r.auVerifier.Store(&fn)
+}
+
+// SetAUVerifyFailedHook installs the observability callback fired on every
+// access unit dropped by signature verification (metrics/alarm bridging).
+func (r *Receiver) SetAUVerifyFailedHook(fn func()) {
+	r.onAUVerifyFailed = fn
+}
+
+// AUVerifyFailures reports how many access units were dropped by signature
+// verification (level-B diagnostics).
+func (r *Receiver) AUVerifyFailures() uint64 { return r.auVerifyFailed.Load() }
+
+// MediaSecurityArmed reports which GB35114 media-security hooks are active
+// (payload decryption at level C, AU-signature verification at level B/C).
+func (r *Receiver) MediaSecurityArmed() (decrypt, verify bool) {
+	return r.payloadDecryptor.Load() != nil, r.auVerifier.Load() != nil
+}
+
+// AudioOnly reports whether this receiver serves an audio-only session —
+// the keyframe watchdog exempts such sessions (no IDR ever arrives).
+func (r *Receiver) AudioOnly() bool {
+	return r.audioOnlyHint.Load() || r.bareAudio.Load()
+}
+
+// looksLikePSPacket reports whether the payload opens with an MPEG program
+// stream start code (00 00 01 + PS pack/system/map/PES stream id).
+func looksLikePSPacket(p []byte) bool {
+	return len(p) >= 4 && p[0] == 0 && p[1] == 0 && p[2] == 1 && p[3] >= 0xB9
+}
+
+// emitBareAudio delivers one bare G.711 RTP payload as an audio frame.
+// The m=audio clock is 8 kHz and G.711 carries one sample per byte, so the
+// RTP timestamp doubles as the sample count offset.
+func (r *Receiver) emitBareAudio(pkt *rtp.Packet) {
+	codec := "g711a"
+	if pkt.Header.PayloadType == 0 {
+		codec = "g711u"
+	}
+	frame := AudioFrame{
+		Codec:    codec,
+		Data:     pkt.Payload,
+		PTSTicks: int64(pkt.Header.Timestamp),
+		Samples:  len(pkt.Payload),
+	}
+	r.audioEmitted.Add(1)
+	r.lastEmissionUnix.Store(time.Now().UnixNano())
+	if r.AudioCallback == nil {
+		return
+	}
+	r.AudioCallback(frame)
+}
+
+func (r *Receiver) HasReceivedRTP() bool {
+	return r.rtpPacketsReceived.Load() > 0
+}
+
+// SinceLastPacket returns how long ago the last RTP packet arrived.
+// A session whose stream stops (device firmware stall) must be recycled or
+// its zombie receiver blocks every future auto-INVITE (idempotency check).
+func (r *Receiver) SinceLastPacket() time.Duration {
+	ns := r.lastPktUnix.Load()
+	if ns == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, ns))
+}
+
+// SinceLastIDR returns how long ago the last IDR access unit was emitted
+// (never if ok=false). Devices that only emit a keyframe at stream start go
+// stale for segment starts; the session layer watches this.
+func (r *Receiver) SinceLastIDR() (time.Duration, bool) {
+	ns := r.lastIDRUnix.Load()
+	if ns == 0 {
+		return 0, false
+	}
+	return time.Since(time.Unix(0, ns)), true
+}
+
+// SinceLastEmission returns how long ago the last AU or audio frame was
+// produced (0 when nothing has been produced yet).
+func (r *Receiver) SinceLastEmission() time.Duration {
+	ns := r.lastEmissionUnix.Load()
+	if ns == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, ns))
+}
+
+// Classification returns the once-per-session payload classification:
+// "ps", "es", or "bare-audio" — "" before the first payload was drained.
+func (r *Receiver) Classification() string {
+	if v, ok := r.classification.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+// Stalled reports the wedged-demuxer signature (#142): RTP is still
+// arriving, but nothing has been produced for longer than stallFor. A
+// session without recent traffic is never stalled (that is a stopped
+// source — the session layer's own concern), and a session that never
+// received RTP is not stalled either.
+func (r *Receiver) Stalled(stallFor time.Duration) bool {
+	if !r.running.Load() || r.rtpPacketsReceived.Load() == 0 {
+		return false
+	}
+	if r.SinceLastPacket() > stallFor {
+		return false
+	}
+	return r.SinceLastEmission() > stallFor
+}
+
+// readLoop reads RTP packets from the network, reassembles access units,
+// and feeds them to the PS demuxer.
+func (r *Receiver) readLoop(ctx context.Context) {
+	defer func() {
+		r.running.Store(false)
+		logger().Info("gb28181: read loop exited", "camera_id", r.cameraID)
+	}()
+
+	buf := make([]byte, rtpReadBufSize)
+
+	for r.running.Load() {
+		var n int
+		var err error
+
+		if r.isTCP.Load() {
+			n, err = r.readTCP(buf)
+		} else {
+			n, err = r.conn.Read(buf)
+		}
+
+		if err != nil {
+			if !r.running.Load() {
+				return
+			}
+			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+				logger().Info("gb28181: connection closed", "camera_id", r.cameraID)
+				return
+			}
+			logger().Warn("gb28181: read error", "camera_id", r.cameraID, "error", err)
+			return
+		}
+
+		if n == 0 {
+			continue
+		}
+
+		r.rtpPacketsReceived.Add(1)
+		r.lastPktUnix.Store(time.Now().UnixNano())
+		if r.rtpPacketsReceived.Load() == 1 {
+			// Seed the emission clock: a wedged demuxer that never produces
+			// anything must still age out (Stalled), not read "never
+			// emitted" forever.
+			r.lastEmissionUnix.Store(time.Now().UnixNano())
+			if r.OnFirstRTP != nil {
+				r.OnFirstRTP()
+			}
+		}
+
+		// Parse RTP packet. pion/rtp aliases buf — the payload slice points
+		// into buf, which the next Read overwrites — so the payload is
+		// cloned before the packet is stored in the jitter buffer.
+		var pkt rtp.Packet
+		if err := pkt.Unmarshal(buf[:n]); err != nil {
+			logger().Warn("gb28181: RTP unmarshal failed", "camera_id", r.cameraID, "error", err)
+			r.rtpPacketsDropped.Add(1)
+			continue
+		}
+
+		pkt.Payload = append([]byte(nil), pkt.Payload...)
+
+		// GB35114 level C: un-XOR the payload before reassembly so the PS
+		// demuxer sees plaintext. Per-packet IVs keep the keystream
+		// independent of packet loss.
+		if p := r.payloadDecryptor.Load(); p != nil {
+			pkt.Payload = (*p).Crypt(pkt.Payload, pkt.Header.SSRC, pkt.Header.SequenceNumber)
+		}
+
+		// Feed to jitter buffer for reassembly
+		if err := r.feedJitterBuffer(&pkt); err != nil {
+			logger().Debug("gb28181: jitter buffer error", "camera_id", r.cameraID, "error", err)
+			r.rtpPacketsDropped.Add(1)
+			continue
+		}
+	}
+
+	// Flush any remaining buffered packets
+	r.flushJitterBuffer()
+}
+
+// readTCP reads an RTP packet from TCP with framing detection.
+// Supports RFC 4571 (2-byte length) and GB28181 0x24 framing
+// ('$' + 1-byte channel + 2-byte big-endian length = 4-byte header).
+func (r *Receiver) readTCP(buf []byte) (int, error) {
+	// Read framing header
+	if r.tcpMode == TCPModeAuto {
+		// Read first byte to auto-detect framing
+		var first [1]byte
+		if _, err := io.ReadFull(r.conn, first[:]); err != nil {
+			return 0, err
+		}
+
+		if first[0] == 0x24 {
+			r.tcpMode = TCPMode0x24
+			buf[0] = first[0]
+			// Rest of 0x24 framing: channel (1) + 2-byte length
+			if _, err := io.ReadFull(r.conn, buf[1:4]); err != nil {
+				return 0, err
+			}
+		} else {
+			r.tcpMode = TCPModeRFC4571
+			buf[0] = first[0]
+			// Read second byte of the 2-byte length
+			if _, err := io.ReadFull(r.conn, buf[1:2]); err != nil {
+				return 0, err
+			}
+		}
+	} else {
+		// Read framing based on known mode
+		if r.tcpMode == TCPMode0x24 {
+			if _, err := io.ReadFull(r.conn, buf[:4]); err != nil {
+				return 0, err
+			}
+		} else {
+			if _, err := io.ReadFull(r.conn, buf[:2]); err != nil {
+				return 0, err
+			}
+		}
+	}
+
+	// Parse length
+	var length uint16
+	if r.tcpMode == TCPMode0x24 {
+		length = binary.BigEndian.Uint16(buf[2:4])
+	} else {
+		length = binary.BigEndian.Uint16(buf[:2])
+	}
+
+	if length == 0 || int(length) > len(buf) {
+		return 0, fmt.Errorf("gb28181: invalid length %d", length)
+	}
+
+	// Read RTP payload
+	n, err := io.ReadFull(r.conn, buf[:length])
+	if err != nil {
+		return 0, err
+	}
+
+	return n, nil
+}
+
+// feedJitterBuffer adds an RTP packet to the jitter buffer and emits
+// complete access units when the marker bit is set.
+func (r *Receiver) feedJitterBuffer(pkt *rtp.Packet) error {
+	// SSRC isolation: latch the dialog's SSRC from the first packet and drop
+	// everything else (stale sender on a recycled port — see the struct
+	// comment). One foreign AU interleaved mid-stream corrupts the demuxer
+	// state for the rest of the session.
+	if !r.ssrcLatched.Load() {
+		r.expectedSSRC.Store(pkt.Header.SSRC)
+		r.ssrcLatched.Store(true)
+	} else if pkt.Header.SSRC != r.expectedSSRC.Load() {
+		r.foreignDrops.Add(1)
+		if !r.foreignLogged.Load() {
+			r.foreignLogged.Store(true)
+			logger().Warn("gb28181: dropping RTP from foreign SSRC on session port",
+				"camera_id", r.cameraID,
+				"expected_ssrc", r.expectedSSRC.Load(),
+				"foreign_ssrc", pkt.Header.SSRC)
+		}
+		r.rtpPacketsDropped.Add(1)
+		return nil
+	}
+
+	r.jitterBufferMu.Lock()
+	defer r.jitterBufferMu.Unlock()
+
+	seq := pkt.Header.SequenceNumber
+
+	// Initialize base sequence number on first packet
+	if !r.baseSeqSet {
+		r.baseSeq = seq
+		r.baseSeqSet = true
+		r.lastSeq = seq
+	}
+
+	// Detect wrap-around (seq < lastSeq and gap > 1000)
+	seqDelta := int16(seq - r.lastSeq)
+	if seqDelta < -1000 {
+		// Wrap-around detected
+		r.baseSeq = seq
+	}
+
+	// Buffer size check
+	if len(r.jitterBuffer) >= r.maxJitterPackets {
+		// Force flush to make room. Mid-AU: the demuxer only accumulates
+		// (complete=false) — partial NALUs are never emitted.
+		r.emitAccessUnitsLocked()
+	}
+
+	// Store packet
+	r.jitterBuffer[seq] = pkt
+	r.lastSeq = seq
+
+	// GB35114-C session awaiting its decryptor: hold the run (ciphertext)
+	// until arming retro-decrypts and releases it — draining now would
+	// misclassify and feed garbage.
+	if r.expectDecryptor.Load() && r.payloadDecryptor.Load() == nil {
+		return nil
+	}
+
+	// Marker bit indicates AU boundary - emit complete AU
+	if pkt.Header.Marker {
+		r.emitAccessUnitsLocked()
+	}
+
+	return nil
+}
+
+// emitAccessUnitsLocked reassembles packets in sequence order and emits
+// complete access units. Must be called with jitterBufferMu held. An emission
+// ends an access unit only when the drained run's final packet carries the RTP
+// marker bit (see endedOnMarker below).
+//
+// Loss recovery: when the packet at baseSeq is missing (UDP loss), the
+// contiguous drain below would stall forever. Instead the gap is skipped —
+// baseSeq advances to the lowest buffered sequence number — so the stream
+// continues (the partial AU is dropped, which the PS demuxer tolerates)
+// instead of freezing and growing the buffer without bound.
+func (r *Receiver) emitAccessUnitsLocked() {
+	for {
+		packets := r.drainContiguousRunLocked()
+		if len(packets) == 0 {
+			return
+		}
+		// Split the run at MARKER boundaries: a contiguous run can span
+		// several complete AUs (held packets released on decryptor arming,
+		// gap-skip re-runs, force flushes) — stitching them into one AU
+		// would hand consumers mis-framed multi-frame emissions.
+		start := 0
+		for i, pkt := range packets {
+			if pkt.Header.Marker || i == len(packets)-1 {
+				r.processRunLocked(packets[start : i+1])
+				start = i + 1
+			}
+		}
+	}
+}
+
+// drainContiguousRunLocked collects the ordered contiguous run of packets
+// from baseSeq (deleting as it goes), skipping a leading sequence gap when
+// baseSeq itself is missing. An empty result means nothing is drainable.
+func (r *Receiver) drainContiguousRunLocked() []*rtp.Packet {
+	// Build the ordered, CONTIGUOUS run of packets by sequence number starting
+	// at baseSeq. The loop runs until the run breaks at a gap — comparing
+	// against len(r.jitterBuffer) as the bound would be wrong: entries are
+	// deleted as they are collected, so the bound shrinks in lockstep and the
+	// drain stops after half the run. Undersized mid-AU feeds delayed PES
+	// completion until after the marker packet, and the marker feed then
+	// extracted the AU with its final PES still pending — every large frame
+	// (H.264 IDR ≥ maxPESPayload) was cut at the first PES chunk (#444).
+	var packets []*rtp.Packet
+	for {
+		targetSeq := r.baseSeq + uint16(len(packets))
+		pkt, ok := r.jitterBuffer[targetSeq]
+		if !ok {
+			break
+		}
+		packets = append(packets, pkt)
+		delete(r.jitterBuffer, targetSeq)
+	}
+
+	if len(packets) == 0 {
+		// baseSeq itself is missing: skip the gap to the lowest buffered seq
+		// that is AHEAD of baseSeq (positive 16-bit distance — wrap-safe).
+		next, ok := r.nextBufferedSeqLocked()
+		if !ok {
+			return nil
+		}
+		r.packetsDroppedU++
+		logger().Debug("gb28181: RTP packet loss — skipping gap",
+			"camera_id", r.cameraID, "from_seq", r.baseSeq, "to_seq", next)
+		// The AU in flight lost bytes on the wire — its pending PES/ES
+		// reassembly would complete from mismatched halves (a frame with a
+		// hole decodes as half-frame corruption). Drop it; the stream resyncs
+		// at the next AU boundary.
+		r.demuxer.DropPartialVideo()
+		if r.es != nil {
+			r.es.DropPartial()
+		}
+		r.baseSeq = next
+		// Drain the buffered packets above the gap.
+		return r.drainContiguousRunLocked()
+	}
+	return packets
+}
+
+// processRunLocked reassembles one packet run (ending on its AU's marker
+// when complete) and emits its access units.
+func (r *Receiver) processRunLocked(packets []*rtp.Packet) {
+	// Advance base sequence to account for drained packets
+	r.baseSeq += uint16(len(packets))
+
+	// A real AU boundary exists only when the drained run ENDS on the marker
+	// packet. Passing the caller's `complete` blindly was wrong twice: a
+	// force-flush run could end exactly on a burst-final marker (harmless), but
+	// a marker-triggered drain that stopped at a sequence gap mid-burst, or a
+	// teardown flush, claimed completeness for a run the wire never finished.
+	endedOnMarker := packets[len(packets)-1].Header.Marker
+
+	// ES over RTP (issue #110): bare H.264/H.265 payloads depacketize per
+	// packet (FU headers live in each packet), so the cross-packet byte
+	// stitching below must not merge them first. The mode is decided ONCE
+	// per session, on the very first payload — PS streams open with a pack
+	// start code (00 00 01 Bx) which never looks like a NAL; re-classifying
+	// every drained run would let a mid-stream PS fragment (arbitrary
+	// leading bytes) false-positive as ES.
+	if !r.classified.Load() && len(packets[0].Payload) > 0 {
+		r.classified.Store(true)
+		classification := "ps"
+		switch {
+		case r.audioOnlyHint.Load() && !looksLikePSPacket(packets[0].Payload):
+			// Audio-only session whose payloads are not PS: bare G.711
+			// RTP (the m=audio-only INVITE form, #135). PS-muxed audio
+			// still falls through to the PS demuxer's audio path.
+			// The hint MUST outrank looksLikeESPacket: an audio-only
+			// session can never be an elementary VIDEO stream, and A-law
+			// silence 0x55 reads as H.264 NAL type 21 — quiet-start
+			// sessions latched into the ES demuxer and emitted nothing
+			// for their whole lifetime (#142).
+			r.bareAudio.Store(true)
+			classification = "bare-audio"
+		case looksLikeESPacket(packets[0].Payload):
+			r.es = NewESDemuxer()
+			r.esLatch.Store(true)
+			classification = "es"
+		}
+		r.classification.Store(classification)
+		logger().Info("gb28181: RTP payload classified",
+			"camera_id", r.cameraID, "mode", classification)
+	}
+	if r.bareAudio.Load() {
+		for _, pkt := range packets {
+			if len(pkt.Payload) == 0 {
+				continue
+			}
+			// GB35114 level B on bare-audio sessions: each packet is its
+			// own access unit, so its signature rides the packet itself.
+			// Fail closed (drop the packet) like the PS path drops AUs.
+			if v := r.auVerifier.Load(); v != nil {
+				sig := pkt.Header.GetExtension(RTPExtAUSignature)
+				if len(sig) == 0 {
+					r.auVerifyFailed.Add(1)
+					if r.onAUVerifyFailed != nil {
+						r.onAUVerifyFailed()
+					}
+					logger().Warn("gb28181: GB35114 AU signature missing — dropping audio packet",
+						"camera_id", r.cameraID)
+					continue
+				}
+				if err := (*v)(pkt.Payload, pkt.Header.SSRC, pkt.Header.Timestamp, sig); err != nil {
+					r.auVerifyFailed.Add(1)
+					if r.onAUVerifyFailed != nil {
+						r.onAUVerifyFailed()
+					}
+					logger().Warn("gb28181: GB35114 AU signature rejected — dropping audio packet",
+						"camera_id", r.cameraID, "error", err)
+					continue
+				}
+			}
+			r.emitBareAudio(pkt)
+		}
+		return
+	}
+	if r.esLatch.Load() {
+		for _, pkt := range packets {
+			if err := r.es.FeedPacket(pkt.Payload); err != nil {
+				logger().Debug("gb28181: ES depacketize error",
+					"camera_id", r.cameraID, "error", err)
+			}
+		}
+		if !endedOnMarker {
+			// Collect until the AU boundary, mirroring the PS burst model.
+			return
+		}
+		// GB35114 level B on ES sessions: the signature covers the stitched
+		// per-packet payloads (the sender's pre-fragmentation AU bytes).
+		if v := r.auVerifier.Load(); v != nil {
+			var esAU []byte
+			for _, pkt := range packets {
+				esAU = append(esAU, pkt.Payload...)
+			}
+			last := packets[len(packets)-1]
+			sig := last.Header.GetExtension(RTPExtAUSignature)
+			err := errAUSignatureMissing
+			if len(sig) > 0 {
+				err = (*v)(esAU, last.Header.SSRC, last.Header.Timestamp, sig)
+			}
+			if err != nil {
+				r.auVerifyFailed.Add(1)
+				if r.onAUVerifyFailed != nil {
+					r.onAUVerifyFailed()
+				}
+				logger().Warn("gb28181: GB35114 AU signature rejected — dropping ES access unit",
+					"camera_id", r.cameraID, "error", err)
+				r.es.DropPartial()
+				return
+			}
+		}
+		nalus := r.es.TakeAU()
+		if len(nalus) == 0 {
+			return
+		}
+		lastPkt := packets[len(packets)-1]
+		r.ptsClock.Store(int64(lastPkt.Header.Timestamp))
+		subAUs := splitAUsByFrame(nalus, r.es.Codec() == "h265")
+		for _, subAU := range subAUs {
+			r.emitAULocked(subAU, int64(lastPkt.Header.Timestamp))
+		}
+		return
+	}
+
+	// Stitch payloads across packets (cross-packet byte stitching)
+	var auPayload []byte
+	for _, pkt := range packets {
+		auPayload = append(auPayload, pkt.Payload...)
+	}
+
+	if len(auPayload) == 0 {
+		return
+	}
+
+	// Convert RTP timestamp to 90kHz PTS
+	// RTP timestamp is 90kHz clock, same as NVR PTS
+	lastPkt := packets[len(packets)-1]
+	ptsTicks := int64(lastPkt.Header.Timestamp)
+	r.ptsClock.Store(ptsTicks)
+
+	// GB35114 level B: verify the AU signature carried in the marker
+	// packet's RTP header extension. The signature covers the stitched PS
+	// bytes plus the SSRC/timestamp binding. Fail closed: an invalid
+	// signature, or a marker AU with no signature at all (an attacker could
+	// strip the extension), drops the whole access unit. (ES-over-RTP
+	// sessions depacketize per-packet and are not signature-verified.)
+	if v := r.auVerifier.Load(); v != nil && endedOnMarker {
+		sig := lastPkt.Header.GetExtension(RTPExtAUSignature)
+		if len(sig) == 0 {
+			r.auVerifyFailed.Add(1)
+			if r.onAUVerifyFailed != nil {
+				r.onAUVerifyFailed()
+			}
+			logger().Warn("gb28181: GB35114 AU signature missing — dropping access unit",
+				"camera_id", r.cameraID)
+			return
+		}
+		if err := (*v)(auPayload, lastPkt.Header.SSRC, lastPkt.Header.Timestamp, sig); err != nil {
+			r.auVerifyFailed.Add(1)
+			if r.onAUVerifyFailed != nil {
+				r.onAUVerifyFailed()
+			}
+			logger().Warn("gb28181: GB35114 AU signature rejected — dropping access unit",
+				"camera_id", r.cameraID, "error", err)
+			return
+		}
+	}
+
+	// Feed to Stage 2: PS demuxer
+	nalus, err := r.demuxer.FeedAU(auPayload, ptsTicks, endedOnMarker)
+	if err != nil {
+		logger().Debug("gb28181: PS demux error", "camera_id", r.cameraID, "error", err)
+		return
+	}
+
+	// If no NALUs, this was a non-video PS packet (e.g., system header)
+	if len(nalus) == 0 {
+		r.dispatchAudioLocked()
+		return
+	}
+
+	// One marker can cover multiple frames when the AU boundary was lost
+	// upstream (dropped marker packet → concatenated PS bursts → the demuxer
+	// returns both frames' NALUs together). Split at VCL frame boundaries so
+	// every consumer gets exactly one frame per access unit.
+	subAUs := splitAUsByFrame(nalus, r.demuxer.Codec() == "h265")
+
+	for _, subAU := range subAUs {
+		r.emitAULocked(subAU, ptsTicks)
+	}
+	r.dispatchAudioLocked()
+}
+
+// emitAULocked fans one single-frame access unit out to the hub and the
+// registered callbacks. Must be called with jitterBufferMu held.
+func (r *Receiver) emitAULocked(au [][]byte, ptsTicks int64) {
+	r.auEmitted.Add(1)
+	r.lastEmissionUnix.Store(time.Now().UnixNano())
+
+	// Detect IDR frame
+	isH265 := r.Codec() == "h265"
+	isIDR := nalutil.IsIDR(au, isH265)
+	if isIDR {
+		r.lastIDRUnix.Store(time.Now().UnixNano())
+	}
+
+	// Broadcast to StreamHub (non-blocking, nil-safe for recorder-bridged sessions)
+	if r.hub != nil {
+		r.hub.Broadcast(ptsTicks, au, isIDR)
+	}
+
+	// Prefer AU-granular callback (recorders need full AU grouping); fall
+	// back to the legacy per-NALU callback.
+	if r.AUCallback != nil {
+		r.AUCallback(au, ptsTicks, isIDR)
+	} else if r.NALUCallback != nil {
+		for _, nalu := range au {
+			r.NALUCallback(nalu, ptsTicks, isIDR)
+		}
+	}
+}
+
+// dispatchAudioLocked drains demuxed audio frames to the callback. Must be
+// called with jitterBufferMu held (audio demux state lives under the same
+// lock as video reassembly).
+func (r *Receiver) dispatchAudioLocked() {
+	frames := r.demuxer.DrainAudio()
+	if len(frames) > 0 {
+		r.audioEmitted.Add(int64(len(frames)))
+		r.lastEmissionUnix.Store(time.Now().UnixNano())
+	}
+	if r.AudioCallback == nil {
+		return // frames already drained and counted as production
+	}
+	for _, frame := range frames {
+		r.AudioCallback(frame)
+	}
+}
+
+// nextBufferedSeqLocked returns the buffered sequence number closest ahead of
+// baseSeq (positive int16 distance, wrap-safe), or ok=false when the buffer
+// holds nothing ahead. Must be called with jitterBufferMu held.
+func (r *Receiver) nextBufferedSeqLocked() (uint16, bool) {
+	var best uint16
+	found := false
+	for seq := range r.jitterBuffer {
+		if int16(seq-r.baseSeq) <= 0 {
+			continue // stale (already passed) — drop it
+		}
+		if !found || int16(seq-best) < 0 {
+			best = seq
+			found = true
+		}
+	}
+	if !found {
+		// Nothing ahead: the buffer only holds stale entries — clear them.
+		r.jitterBuffer = make(map[uint16]*rtp.Packet)
+	}
+	return best, found
+}
+
+// flushJitterBuffer emits any remaining packets in the jitter buffer.
+func (r *Receiver) flushJitterBuffer() {
+	r.jitterBufferMu.Lock()
+	defer r.jitterBufferMu.Unlock()
+
+	// Emit any remaining packets (a run ending without a marker extracts
+	// nothing here — the demuxer.Flush below drains the residual bytes).
+	if len(r.jitterBuffer) > 0 {
+		r.emitAccessUnitsLocked()
+	}
+
+	// Flush demuxer residual data
+	nalus := r.demuxer.Flush()
+	if len(nalus) > 0 {
+		isH265 := r.demuxer.Codec() == "h265"
+		ptsTicks := r.ptsClock.Load()
+		for _, subAU := range splitAUsByFrame(nalus, isH265) {
+			isIDR := nalutil.IsIDR(subAU, isH265)
+			if r.hub != nil {
+				r.hub.Broadcast(ptsTicks, subAU, isIDR)
+			}
+
+			if r.AUCallback != nil {
+				r.AUCallback(subAU, ptsTicks, isIDR)
+			} else if r.NALUCallback != nil {
+				for _, nalu := range subAU {
+					r.NALUCallback(nalu, ptsTicks, isIDR)
+				}
+			}
+		}
+		r.dispatchAudioLocked()
+	}
+}
+
+// Metrics returns receiver metrics.
+func (r *Receiver) Metrics() map[string]int64 {
+	return map[string]int64{
+		"packets_received":     r.rtpPacketsReceived.Load(),
+		"packets_dropped":      r.rtpPacketsDropped.Load(),
+		"gap_skipped_packets":  int64(r.gapSkippedPackets()),
+		"au_emitted":           r.auEmitted.Load(),
+		"audio_frames_emitted": r.audioEmitted.Load(),
+	}
+}
+
+// Codec returns the detected codec type from the PS demuxer.
+func (r *Receiver) Codec() string {
+	if r.esLatch.Load() && r.es != nil {
+		return r.es.Codec()
+	}
+	return r.demuxer.Codec()
+}

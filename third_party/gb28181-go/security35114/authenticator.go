@@ -1,0 +1,351 @@
+//go:build gb35114
+
+// The device-side GB35114 A-level REGISTER state machine, wired into the
+// device.Server through the RegisterAuthenticator seam (see
+// device/authenticator.go):
+//
+//	REGISTER  (Authorization: Capability …)          device → platform
+//	401       (WWW-Authenticate: … random1="…")      platform → device
+//	REGISTER  (Authorization: Unidirection/Bidirection … sign1="…")
+//	200 OK    (SecurityInfo: cryptkey [, sign2])     platform → device
+//
+// After the handshake the negotiated VKEK keys the Note-header integrity
+// of every subsequent SIP request (OutgoingSigner).
+
+package security35114
+
+import (
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"io"
+	"sync"
+	"time"
+
+	"github.com/emmansun/gmsm/smx509"
+	"github.com/mickeyzzc/gb28181-go/device"
+)
+
+// Options configures an Authenticator. Device, DeviceID and ServerID are
+// required; the rest carry safe defaults.
+type Options struct {
+	// Device is the FDWSF SM2 signing identity (certificate + key).
+	Device *Identity
+	// PlatformCert is the SIP server's signing certificate, required to
+	// verify sign2 of Bidirection handshakes.
+	PlatformCert *smx509.Certificate
+	// DeviceID is the 20-digit GB28181 device ID.
+	DeviceID string
+	// ServerID is the 20-digit SIP server (platform) ID.
+	ServerID string
+	// KeyVersion labels the device key in the Capability announcement;
+	// defaults to the current UTC time in Date-header format.
+	KeyVersion string
+	// IncludeDeviceCert attaches the certificate PEM as cnonce in the
+	// Capability announcement for platforms that do not pre-provision it.
+	IncludeDeviceCert bool
+	// RandomEncoding selects the signed-payload representation (default
+	// ConcatWireStrings, matching observed captures).
+	RandomEncoding RandomEncoding
+	// Sign2Order selects the platform sign2 operand order (default
+	// Sign2R1R2, the standard text order).
+	Sign2Order Sign2Order
+	// Rand supplies randomness for random2 (default crypto/rand).
+	Rand io.Reader
+}
+
+// Authenticator implements the device.RegisterAuthenticator and
+// device.OutgoingSigner seams for GB35114 A-level.
+type Authenticator struct {
+	opts Options
+
+	mu      sync.Mutex
+	mode    Mode
+	random1 string
+	random2 string
+	vkek    []byte
+	vkekVer int // handshake generation of vkek (mirrors the platform's counter)
+	// handshakeVer is the platform-assigned generation from the
+	// SecurityInfo's vkekver parameter (>0). It is authoritative for the
+	// INVITE answer's vkekver label — a device-local counter restarts at 1
+	// on every process restart and collides with the platform's
+	// historical key ring (issue #157). 0 = the platform did not send one
+	// (fallback to the local count).
+	handshakeVer int
+}
+
+// New validates the options and returns a ready Authenticator.
+func New(opts Options) (*Authenticator, error) {
+	if opts.Device == nil {
+		return nil, errors.New("security35114: Options.Device is required")
+	}
+	if opts.DeviceID == "" || opts.ServerID == "" {
+		return nil, errors.New("security35114: Options.DeviceID and Options.ServerID are required")
+	}
+	if opts.KeyVersion == "" {
+		opts.KeyVersion = FormatDate(time.Now())
+	}
+	if opts.Rand == nil {
+		opts.Rand = rand.Reader
+	}
+	return &Authenticator{opts: opts}, nil
+}
+
+// Mode reports the scheme negotiated by the last challenge ("" before one
+// arrives).
+func (a *Authenticator) Mode() Mode {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.mode
+}
+
+// VKEK returns the negotiated video-key-encryption-key, or nil before the
+// handshake completes.
+func (a *Authenticator) VKEK() []byte {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.vkek == nil {
+		return nil
+	}
+	out := make([]byte, len(a.vkek))
+	copy(out, a.vkek)
+	return out
+}
+
+// InitialAuthorization implements device.RegisterAuthenticator: the
+// Capability announcement of the first REGISTER.
+func (a *Authenticator) InitialAuthorization() string {
+	if !a.opts.IncludeDeviceCert {
+		return BuildCapabilityAuthorization(a.opts.KeyVersion, "")
+	}
+	return BuildCapabilityAuthorization(a.opts.KeyVersion, a.opts.Device.CertPEM)
+}
+
+// AuthorizeWithChallenge implements device.RegisterAuthenticator: it
+// consumes the 401 challenge, draws random2, signs and returns the
+// Authorization header for the retried REGISTER.
+func (a *Authenticator) AuthorizeWithChallenge(wwwAuthenticate string) (string, error) {
+	ch, err := ParseChallenge(wwwAuthenticate)
+	if err != nil {
+		return "", err
+	}
+	random2, err := a.newRandom()
+	if err != nil {
+		return "", err
+	}
+	payload := SignAuthPayload(ch.Random1, random2, a.opts.ServerID, a.opts.RandomEncoding)
+	sign1, err := SignMessage(a.opts.Device.PrivateKey, payload)
+	if err != nil {
+		return "", fmt.Errorf("security35114: signing challenge: %w", err)
+	}
+
+	a.mu.Lock()
+	a.mode, a.random1, a.random2 = ch.Mode, ch.Random1, random2
+	a.mu.Unlock()
+
+	return BuildAuthAuthorization(ch, random2, a.opts.ServerID, a.opts.DeviceID, sign1), nil
+}
+
+// VerifyOK implements device.RegisterAuthenticator: it opens the cryptkey
+// envelope of the 200 OK, and for Bidirection additionally verifies the
+// platform's sign2 against the pre-provisioned platform certificate and
+// the handshake state.
+func (a *Authenticator) VerifyOK(securityInfo string) error {
+	a.mu.Lock()
+	mode, random1, random2 := a.mode, a.random1, a.random2
+	a.mu.Unlock()
+	if mode == "" {
+		return errors.New("security35114: SecurityInfo received before a challenge was answered")
+	}
+
+	si, err := ParseSecurityInfo(securityInfo)
+	if err != nil {
+		return err
+	}
+	vkek, err := DecryptVKEK(a.opts.Device.PrivateKey, si.CryptKey)
+	if err != nil {
+		return fmt.Errorf("security35114: opening cryptkey: %w", err)
+	}
+	if si.Mode == ModeBidirection {
+		if a.opts.PlatformCert == nil {
+			return errors.New("security35114: Bidirection requires Options.PlatformCert to verify sign2")
+		}
+		// The echoed handshake fields must match this handshake exactly —
+		// anything else is a replay or a foreign session.
+		if si.Random1 != random1 || si.Random2 != random2 ||
+			si.DeviceID != a.opts.DeviceID || si.ServerID != a.opts.ServerID {
+			return errors.New("security35114: SecurityInfo handshake fields do not match this handshake")
+		}
+		payload := Sign2Payload(si.Random1, si.Random2, si.DeviceID, si.CryptKey, a.opts.Sign2Order, a.opts.RandomEncoding)
+		if err := VerifyMessage(a.opts.PlatformCert, payload, si.Sign2); err != nil {
+			return fmt.Errorf("security35114: verifying sign2: %w", err)
+		}
+	}
+
+	a.mu.Lock()
+	a.vkekVer++
+	a.vkek = vkek
+	a.handshakeVer = si.VKEKVer
+	a.mu.Unlock()
+	return nil
+}
+
+// DecorateOutgoing implements device.OutgoingSigner: it stamps the Date
+// and Note headers carrying the keyed-SM3 digest onto every non-REGISTER
+// request. Messages before the handshake completes, or REGISTER itself,
+// pass through untouched.
+func (a *Authenticator) DecorateOutgoing(method, from, to, callID, body string) (date string, note string) {
+	a.mu.Lock()
+	vkek := a.vkek
+	a.mu.Unlock()
+	if vkek == nil || method == "REGISTER" {
+		return "", ""
+	}
+	date = FormatDate(time.Now())
+	note = BuildNoteHeader(method, from, to, callID, date, vkek, body, VKEKRaw)
+	return date, note
+}
+
+// NoteFreshnessWindow bounds how old a signed request's Date header may
+// be (and how far in the future): beyond it the Note is a replay. The
+// digest alone is self-consistent, so the window is the replay guard.
+const NoteFreshnessWindow = 5 * time.Minute
+
+// noteDateLayout is the wire Date format (see FormatDate).
+const noteDateLayout = "2006-01-02T15:04:05.000"
+
+// VerifyIncomingNote implements device.IncomingNoteVerifier (issue #52):
+// the device-side mirror of DecorateOutgoing — a platform→device request
+// carrying a Note is verified against the negotiated VKEK. A request
+// without a Note passes (mixed-mode Digest platforms). Malformed or
+// stale Dates fail closed: the freshness window is the only replay
+// guard, so a Date it cannot parse disables that guard.
+func (a *Authenticator) VerifyIncomingNote(method, from, to, callID, date, note, body string) error {
+	if note == "" {
+		return nil
+	}
+	a.mu.Lock()
+	vkek := a.vkek
+	a.mu.Unlock()
+	if vkek == nil {
+		return errors.New("security35114: incoming Note before the handshake completed")
+	}
+	stamp, err := time.Parse(noteDateLayout, date)
+	if err != nil {
+		return fmt.Errorf("security35114: incoming Note Date malformed: %w", err)
+	}
+	if skew := time.Since(stamp); skew > NoteFreshnessWindow || skew < -NoteFreshnessWindow {
+		return fmt.Errorf("security35114: incoming Note Date %s outside the ±%s freshness window", date, NoteFreshnessWindow)
+	}
+	if err := VerifyNoteHeader(note, method, from, to, callID, date, vkek, body, VKEKRaw); err != nil {
+		return fmt.Errorf("security35114: incoming Note rejected: %w", err)
+	}
+	return nil
+}
+
+// AnswerMediaSecurity answers an INVITE's "a=security:" offer. The offered
+// level is authoritative (the standard has the SIP server control front-end
+// signing/encryption): level B returns the echoed level only; level C
+// additionally draws a session VEK, seals it under the negotiated VKEK, and
+// returns the payload encryptor alongside the answer attribute value. An
+// empty answer value (level A offer or parse failure reported via err)
+// means the session stays plaintext.
+func (a *Authenticator) AnswerMediaSecurity(offerValue string) (answerValue string, encrypt device.RTPCryptor, err error) {
+	sec, err := ParseSDPSecurity(offerValue)
+	if err != nil {
+		return "", nil, err
+	}
+	if !sec.Level.AtLeast(LevelB) {
+		return "", nil, nil
+	}
+	if !sec.Level.AtLeast(LevelC) {
+		return SDPSecurityAnswer(LevelB, "", 0), nil, nil
+	}
+	vkek := a.VKEK()
+	if vkek == nil {
+		return "", nil, errors.New("security35114: C-level media requested before the handshake completed")
+	}
+	vek, err := GenerateVEK(a.opts.Rand)
+	if err != nil {
+		return "", nil, err
+	}
+	envelope, err := SealVEK(vkek, vek)
+	if err != nil {
+		return "", nil, err
+	}
+	encrypt, err = NewPacketCryptor(vek)
+	if err != nil {
+		return "", nil, err
+	}
+	return SDPSecurityAnswer(LevelC, envelope, a.vkekVersion()), encrypt, nil
+}
+
+// OpenMediaSecurity is the device side of a platform-sent media session
+// (talk downlink): it opens the level-C offer's VEK envelope under the
+// negotiated VKEK and returns the receive-side decryptor plus the closure
+// verifying the platform's per-AU signatures. Level B offers return the
+// verifier only; level A / absent attribute returns nil hooks.
+func (a *Authenticator) OpenMediaSecurity(offerValue string) (decrypt device.RTPCryptor, verify func(au []byte, ssrc, timestamp uint32, sig []byte) error, err error) {
+	sec, err := ParseSDPSecurity(offerValue)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !sec.Level.AtLeast(LevelB) {
+		return nil, nil, nil
+	}
+	verify = a.VerifyMediaSignature
+	if !sec.Level.AtLeast(LevelC) || sec.VEKEnvelope == "" {
+		return nil, verify, nil
+	}
+	vkek := a.VKEK()
+	if vkek == nil {
+		return nil, nil, errors.New("security35114: C-level media offered before the handshake completed")
+	}
+	vek, err := OpenVEK(vkek, sec.VEKEnvelope)
+	if err != nil {
+		return nil, nil, fmt.Errorf("security35114: opening platform VEK envelope: %w", err)
+	}
+	decrypt, err = NewPacketCryptor(vek)
+	if err != nil {
+		return nil, nil, err
+	}
+	return decrypt, verify, nil
+}
+
+// VerifyMediaSignature checks a platform-signed media AU against the
+// pre-provisioned platform certificate.
+func (a *Authenticator) VerifyMediaSignature(au []byte, ssrc, timestamp uint32, sigDER []byte) error {
+	if a.opts.PlatformCert == nil {
+		return errors.New("security35114: no platform certificate to verify media signatures")
+	}
+	return VerifyAU(a.opts.PlatformCert, au, ssrc, timestamp, sigDER)
+}
+
+// vkekVersion snapshots the handshake generation for the INVITE answer's
+// vkekver label: the platform-assigned number when the SecurityInfo carried
+// one (authoritative — it indexes the platform's key ring), else the local
+// handshake count (older/foreign platforms).
+func (a *Authenticator) vkekVersion() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.handshakeVer > 0 {
+		return a.handshakeVer
+	}
+	return a.vkekVer
+}
+
+// SignAU signs one access unit with the device identity (level B media
+// signatures).
+func (a *Authenticator) SignAU(au []byte, ssrc, timestamp uint32) ([]byte, error) {
+	return SignAU(a.opts.Device.PrivateKey, au, ssrc, timestamp)
+}
+
+// newRandom draws the 128-bit random2.
+func (a *Authenticator) newRandom() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := io.ReadFull(a.opts.Rand, buf); err != nil {
+		return "", fmt.Errorf("security35114: drawing random2: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(buf), nil
+}

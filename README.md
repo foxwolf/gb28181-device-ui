@@ -6,19 +6,13 @@
 
 ## 依赖
 
-本仓库通过 `go.mod` 里的 `replace` 引用同级目录中的上游库，**不要修改** `gb28181-go`：
+本仓库通过 `go.mod` 里的 `replace` 引用内置的设备侧库副本（含 Catalog / INVITE 等应答修复）：
 
 ```
-replace github.com/mickeyzzc/gb28181-go => ../gb28181-go
+replace github.com/mickeyzzc/gb28181-go => ./third_party/gb28181-go
 ```
 
-拷贝到 Windows 后，目录关系应是：
-
-```
-E:\src\contribs\gb28181-go
-E:\src\contribs\gb28181-device-ui
-```
-
+本地若仍要联调同级上游源码，可临时改回 `../gb28181-go`，但请自行合并 `third_party/gb28181-go` 中与信令应答相关的修复。默认请使用仓库内 `third_party` 副本，保证平台 Catalog / 点播 INVITE 等应答行为一致。
 ## 重要说明
 
 - **视频源可切换。** 默认仍是库内合成的占位 H.264（每秒一帧，每 5 帧一个 IDR），平台上只能看到“有流”。也可以选择「本机摄像头（FFmpeg）」：程序会以外挂进程调用 `ffmpeg.exe`，经 DirectShow 采集摄像头并编成 H.264，再写入现有的 `FrameSource` 接口。界面和启动逻辑不绑定 FFmpeg，日后若以进程内方式（例如 pion/mediadevices）接入，只需再登记一个后端。
