@@ -82,11 +82,11 @@ type UI struct {
 	previewClickAt  time.Time
 	previewClickPt  image.Point
 
-	startBtn, stopBtn, saveBtn, loadBtn, exitBtn, copyLogsBtn widget.Clickable
+	startBtn, stopBtn, saveBtn, loadBtn, exitBtn, copyLogsBtn, clearLogsBtn widget.Clickable
 
 	formList      layout.List
 	statusList    layout.List
-	logList       layout.List
+	logList       widget.List
 	logPtr        struct{}
 	logStart      logPos
 	logEnd        logPos
@@ -122,7 +122,7 @@ func New() *UI {
 		cfgPath:     appconfig.Path(),
 		formList:    layout.List{Axis: layout.Vertical},
 		statusList:  layout.List{Axis: layout.Vertical},
-		logList:     layout.List{Axis: layout.Vertical},
+		logList:     widget.List{List: layout.List{Axis: layout.Vertical}},
 		stickBottom: true,
 	}
 	u.logs = logview.New(func() {
@@ -320,6 +320,9 @@ func (u *UI) frame(gtx C) {
 	}
 	if u.copyLogsBtn.Clicked(gtx) {
 		u.copyLogsToClipboard(gtx)
+	}
+	if u.clearLogsBtn.Clicked(gtx) {
+		u.clearLogs()
 	}
 	if u.exitBtn.Clicked(gtx) {
 		u.shutdown()
@@ -977,6 +980,8 @@ func (u *UI) logPane(gtx C) D {
 					return l.Layout(gtx)
 				}),
 				layout.Rigid(u.btn(&u.copyLogsBtn, copyLabel, rgb(0x455A64), true)),
+				layout.Rigid(func(gtx C) D { return layout.Spacer{Width: unit.Dp(8)}.Layout(gtx) }),
+				layout.Rigid(u.btn(&u.clearLogsBtn, "清除日志", rgb(0x607080), true)),
 			)
 		}),
 		layout.Rigid(gap(6)),
