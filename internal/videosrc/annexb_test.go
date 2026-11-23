@@ -156,3 +156,100 @@ func dumpAUs(aus []device.AccessUnit) [][]byte {
 	}
 	return out
 }
+
+func encodeUE(v uint32) []byte {
+	n := v + 1
+	zeros := 0
+	for (uint32(1) << (zeros + 1)) <= n {
+		zeros++
+	}
+	total := zeros*2 + 1
+	out := make([]byte, (total+7)/8)
+	bit := 0
+	put := func(b uint32) {
+		if b != 0 {
+			out[bit/8] |= 1 << (7 - (bit % 8))
+		}
+		bit++
+	}
+	for i := 0; i < zeros; i++ {
+		put(0)
+	}
+	put(1)
+	info := n - (1 << zeros)
+	for i := zeros - 1; i >= 0; i-- {
+		put((info >> i) & 1)
+	}
+	return out
+}
+
+func codedSlice(nalType byte, firstMB uint32) []byte {
+	hdr := []byte{(1 << 5) | (nalType & 0x1F)}
+	return append(hdr, encodeUE(firstMB)...)
+}
+
+func TestEncodeUE(t *testing.T) {
+	cases := []uint32{0, 1, 2, 319, 320, 3280, 3600}
+	for _, v := range cases {
+		got, ok := decodeUE(encodeUE(v))
+		if !ok || got != v {
+			t.Fatalf("ue(%d) roundtrip got %d ok=%v bytes=%x", v, got, ok, encodeUE(v))
+		}
+	}
+}
+
+func TestFirstMbInSlice(t *testing.T) {
+	n := codedSlice(1, 0)
+	got, ok := firstMbInSlice(n)
+	if !ok || got != 0 {
+		t.Fatalf("first_mb=0: got %d ok=%v data=%x", got, ok, n)
+	}
+	n = codedSlice(5, 320)
+	got, ok = firstMbInSlice(n)
+	if !ok || got != 320 {
+		t.Fatalf("first_mb=320: got %d ok=%v data=%x", got, ok, n)
+	}
+	if _, ok := firstMbInSlice([]byte{0x67, 0x42}); ok {
+		t.Fatal("SPS should not parse as a slice")
+	}
+}
+
+func TestAnnexB_MultiSliceSamePicture(t *testing.T) {
+	sps := []byte{0x67, 0x42, 0xC0, 0x1E}
+	pps := []byte{0x68, 0xEB, 0x80}
+	idr0 := codedSlice(5, 0)
+	idr1 := codedSlice(5, 320)
+	p0 := codedSlice(1, 0)
+	p1 := codedSlice(1, 320)
+
+	var s AnnexBSplitter
+	stream := bytes.Join([][]byte{sc4(sps), sc4(pps), sc4(idr0), sc4(idr1), sc3(p0), sc3(p1)}, nil)
+	aus := append(s.Push(stream), s.Flush()...)
+	if len(aus) != 2 {
+		t.Fatalf("got %d AUs, want 2 (one IDR picture, one P picture): %v", len(aus), dumpAUs(aus))
+	}
+	if !aus[0].KeyFrame || len(aus[0].NALUs) != 4 {
+		t.Fatalf("IDR AU want SPS+PPS+2 slices, got %v key=%v", dumpAU(aus[0]), aus[0].KeyFrame)
+	}
+	if aus[0].NALUs[2].Type != 5 || aus[0].NALUs[3].Type != 5 {
+		t.Fatalf("IDR slices types: %v", dumpAU(aus[0]))
+	}
+	if aus[1].KeyFrame || len(aus[1].NALUs) != 2 || aus[1].NALUs[0].Type != 1 || aus[1].NALUs[1].Type != 1 {
+		t.Fatalf("P AU want 2 non-IDR slices, got %v key=%v", dumpAU(aus[1]), aus[1].KeyFrame)
+	}
+}
+
+func TestAnnexB_NewPictureStartsAtFirstMbZero(t *testing.T) {
+	p0 := codedSlice(1, 0)
+	p1 := codedSlice(1, 320)
+	p2 := codedSlice(1, 0)
+	var s AnnexBSplitter
+	stream := bytes.Join([][]byte{sc4(p0), sc4(p1), sc4(p2)}, nil)
+	aus := append(s.Push(stream), s.Flush()...)
+	if len(aus) != 2 {
+		t.Fatalf("got %d AUs, want 2: %v", len(aus), dumpAUs(aus))
+	}
+	if len(aus[0].NALUs) != 2 || len(aus[1].NALUs) != 1 {
+		t.Fatalf("slice grouping: %v", dumpAUs(aus))
+	}
+}
